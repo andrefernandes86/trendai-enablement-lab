@@ -228,7 +228,7 @@ aws cloudformation deploy \
     AdminCidr=<your-ip>/32 \
     V1ApiKey=<your-v1-api-key> \
     V1Region=us-east-1 \
-    OllamaModel=tinyllama \
+    OllamaModel=llama3.2:3b \
   --capabilities CAPABILITY_IAM
 ```
 
@@ -241,7 +241,7 @@ aws cloudformation deploy \
 | `V1ApiKey` | *(required)* | Vision One API key (AI Security + File Security scopes) |
 | `V1Region` | `us-east-1` | V1FS region |
 | `V1GuardUrlBase` | *(us endpoint)* | AI Guard API URL — change for non-US tenants |
-| `OllamaModel` | `tinyllama` | LLM model to pull. `tinyllama` is fastest; `llama3.2:3b` gives richer demo responses |
+| `OllamaModel` | `llama3.2:3b` | LLM model to pull. `llama3.2:3b` is the default and gives the best prompt injection demo responses; `tinyllama` starts faster if bandwidth is limited |
 | `InstanceType` | `c5.2xlarge` | EC2 instance type — minimum c5.2xlarge for Ollama |
 | `KeyPairName` | *(blank)* | Optional SSH key pair. Leave blank to use SSM only |
 

@@ -44,15 +44,16 @@ Parameters:
 
   OllamaModel:
     Type: String
-    Default: tinyllama
+    Default: llama3.2:3b
     AllowedValues:
-      - tinyllama
-      - llama3.2:1b
       - llama3.2:3b
+      - llama3.2:1b
+      - tinyllama
       - mistral:7b
     Description: >
-      Ollama model to pull at launch. tinyllama (637 MB) starts fastest.
-      llama3.2:3b gives better demo quality but takes ~5 min to pull.
+      Ollama model to pull at launch. llama3.2:3b (2 GB, ~5 min to pull) is the
+      default and gives the best demo quality for prompt injection scenarios.
+      tinyllama (637 MB) starts faster if bandwidth is limited.
 
   InstanceType:
     Type: String
