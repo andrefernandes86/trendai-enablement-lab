@@ -419,21 +419,25 @@ Resources:
     DependsOn: OidcProvider
     Properties:
       RoleName: !Sub trendai-aisec-${ParticipantName}-ebs-csi-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Federated: !Sub
-                - arn:aws:iam::${AWS::AccountId}:oidc-provider/${OidcId}
-                - OidcId: !Select [1, !Split ['https://', !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
-            Action: sts:AssumeRoleWithWebIdentity
-            Condition:
-              StringEquals:
-                Fn::Sub:
-                  - '${OidcId}:sub'
-                  - OidcId: !Select [1, !Split ['https://', !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
-                Value: 'system:serviceaccount:kube-system:ebs-csi-controller-sa'
+      AssumeRolePolicyDocument: !Sub
+        - >
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "arn:aws:iam::${AWS::AccountId}:oidc-provider/${OidcHost}"
+              },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "${OidcHost}:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa",
+                  "${OidcHost}:aud": "sts.amazonaws.com"
+                }
+              }
+            }]
+          }
+        - OidcHost: !Select [1, !Split ['https://', !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
 
