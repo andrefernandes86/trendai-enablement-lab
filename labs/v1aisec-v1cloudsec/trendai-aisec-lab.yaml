@@ -383,6 +383,54 @@ Resources:
         - Key: Participant
           Value: !Ref ParticipantName
 
+  # ────────────────────────────────────────────
+  # OIDC Provider + EBS CSI Driver addon
+  # Required in EKS 1.23+ for PersistentVolumes
+  # ────────────────────────────────────────────
+
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    DependsOn: EksCluster
+    Properties:
+      Url: !GetAtt EksCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - '9e99a48a9960b14926bb7f3b02e22da2b0ab7280'
+
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    DependsOn: OidcProvider
+    Properties:
+      RoleName: !Sub trendai-aisec-${ParticipantName}-ebs-csi-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub
+                - arn:aws:iam::${AWS::AccountId}:oidc-provider/${OidcId}
+                - OidcId: !Select [1, !Split ['https://', !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                Fn::Sub:
+                  - '${OidcId}:sub'
+                  - OidcId: !Select [1, !Split ['https://', !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
+                Value: 'system:serviceaccount:kube-system:ebs-csi-controller-sa'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn:
+      - EbsCsiRole
+      - NodeGroup
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: aws-ebs-csi-driver
+      ServiceAccountRoleArn: !GetAtt EbsCsiRole.Arn
+
   # Grant the bootstrap EC2 role cluster-admin access via EKS Access Entry
   BootstrapAccessEntry:
     Type: AWS::EKS::AccessEntry
@@ -446,8 +494,7 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -euo pipefail
-          exec > >(tee /var/log/lab-userdata.log | logger -t lab-userdata) 2>&1
+          exec > /var/log/lab-userdata.log 2>&1
 
           echo "=== TrendAI UserData — writing config and starting bootstrap ==="
 

@@ -141,14 +141,17 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: pull
-          image: curlimages/curl:8
+          image: alpine:3
           command: ["/bin/sh", "-c"]
           args:
             - |
-              until curl -sf http://ollama:11434/api/tags > /dev/null; do sleep 5; done
+              apk add --no-cache curl
+              until curl -sf http://ollama:11434/api/tags > /dev/null; do
+                echo "waiting for ollama..."; sleep 5
+              done
               curl -sf -X POST http://ollama:11434/api/pull \
                 -H 'Content-Type: application/json' \
-                -d '{"name":"llama3.2:3b"}' --no-buffer || true
+                -d '{"name":"llama3.2:3b"}' --no-buffer
               echo "Model pull complete."
 OLLAMAEOF
 

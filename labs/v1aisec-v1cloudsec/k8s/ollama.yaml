@@ -94,7 +94,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: pull
-          image: curlimages/curl:8
+          image: alpine:3
           command: ["/bin/sh", "-c"]
           args:
             - |
