@@ -71,8 +71,9 @@ Parameters:
     Type: String
     Default: 0.0.0.0/0
     Description: >
-      CIDR allowed to reach the app LoadBalancer. Defaults to open (0.0.0.0/0)
-      because the NLB is managed by EKS. Restrict to your IP/32 if preferred.
+      CIDR allowed to reach the app (port 8000) and Ollama API (port 11434) on the
+      bootstrap EC2's Elastic IP. Use your public IP as /32 to restrict access.
+      Get your IP: https://checkip.amazonaws.com
 
 # ─────────────────────────────────────────────
 # Conditions
@@ -318,11 +319,37 @@ Resources:
   # Security Groups
   # ────────────────────────────────────────────
 
+  BootstrapEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGwAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub trendai-aisec-${ParticipantName}-eip
+
+  BootstrapEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt BootstrapEip.AllocationId
+      InstanceId: !Ref BootstrapInstance
+
   BootstrapSg:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Bootstrap EC2 — outbound only
+      GroupDescription: Bootstrap EC2 — app + Ollama inbound, all outbound
       VpcId: !Ref LabVpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: !Ref AdminCidr
+          Description: Demo app web UI
+        - IpProtocol: tcp
+          FromPort: 11434
+          ToPort: 11434
+          CidrIp: !Ref AdminCidr
+          Description: Ollama API (AI Scanner)
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -405,6 +432,7 @@ Resources:
     DependsOn:
       - NodeGroup
       - BootstrapAccessEntry
+      - BootstrapEip
     Properties:
       InstanceType: t3.small
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
@@ -815,23 +843,56 @@ Resources:
           CSATTACK
           chmod +x /usr/local/bin/cs-attack
 
-          # ── Wait for app LoadBalancer ──────────────────
-          echo "[*] Waiting for app LoadBalancer hostname..."
-          for i in $(seq 1 30); do
-            LB=$(kubectl get svc trendai-app -n trendai-lab \
-              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            [ -n "$LB" ] && break
-            echo "  attempt $i — waiting 20s..."
-            sleep 20
-          done
+          # ── Port-forward systemd services ──────────────
+          # Expose app and Ollama on the bootstrap EC2's public Elastic IP so they
+          # are reachable from the internet at the fixed IP in the CFN Outputs.
 
-          if [ -n "$LB" ]; then
-            echo "[+] App available at: http://$LB:8000"
-            echo "$LB" > /opt/lab/app-lb-hostname
-          else
-            echo "[!] LoadBalancer hostname not yet assigned — check later with:"
-            echo "    kubectl get svc trendai-app -n trendai-lab"
-          fi
+          cat > /etc/systemd/system/kubectl-pf-app.service <<'SVC_APP'
+          [Unit]
+          Description=kubectl port-forward — trendai-app (port 8000)
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/kubectl port-forward \
+            -n trendai-lab svc/trendai-app 8000:8000 --address=0.0.0.0
+          Restart=always
+          RestartSec=10
+          Environment=KUBECONFIG=/root/.kube/config
+
+          [Install]
+          WantedBy=multi-user.target
+          SVC_APP
+
+          cat > /etc/systemd/system/kubectl-pf-ollama.service <<'SVC_OLLAMA'
+          [Unit]
+          Description=kubectl port-forward — ollama (port 11434)
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/kubectl port-forward \
+            -n trendai-lab svc/ollama 11434:11434 --address=0.0.0.0
+          Restart=always
+          RestartSec=10
+          Environment=KUBECONFIG=/root/.kube/config
+
+          [Install]
+          WantedBy=multi-user.target
+          SVC_OLLAMA
+
+          systemctl daemon-reload
+          systemctl enable kubectl-pf-app kubectl-pf-ollama
+          systemctl start kubectl-pf-app kubectl-pf-ollama
+
+          # ── Wait for app to respond on localhost ───────
+          echo "[*] Waiting for app to respond on port 8000..."
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/ >/dev/null 2>&1 && break
+            echo "  attempt $i — waiting 10s..."
+            sleep 10
+          done
+          curl -sf http://localhost:8000/ >/dev/null 2>&1 \
+            && echo "[+] App is responding on port 8000." \
+            || echo "[!] App not yet responding — port-forward may still be starting."
 
           echo "=== Bootstrap complete ==="
 
@@ -840,45 +901,114 @@ Resources:
 # ─────────────────────────────────────────────
 Outputs:
 
+  # ── Access URLs ───────────────────────────────
+
+  AppUrl:
+    Description: >
+      Demo app web UI — open in browser. AI Guard + File Security active.
+      Allow ~20 min after CREATE_COMPLETE for the app to be ready.
+    Value: !Sub http://${BootstrapEip}:8000
+
+  OllamaApiUrl:
+    Description: >
+      Ollama API endpoint — used by AI Scanner and direct API probes.
+      Try: curl <OllamaApiUrl>/api/tags
+    Value: !Sub http://${BootstrapEip}:11434
+
+  OllamaModelTags:
+    Description: List deployed models (run this after the model-pull Job completes)
+    Value: !Sub http://${BootstrapEip}:11434/api/tags
+
+  # ── Configuration info ────────────────────────
+
+  OllamaModel:
+    Description: LLM model deployed on Ollama
+    Value: llama3.2:3b
+
+  V1Region:
+    Description: Vision One region configured for this stack
+    Value: !Ref V1Region
+
+  V1GuardEndpoint:
+    Description: AI Guard API endpoint configured for this stack
+    Value: !Ref V1GuardUrlBase
+
+  ContainerSecurityStatus:
+    Description: Whether Container Security Helm chart was installed automatically
+    Value: !If
+      - HasContainerSecurityToken
+      - "Auto-installed via Helm at boot (check Vision One > Container Security > Clusters)"
+      - "Token not provided — install manually with: helm install --values k8s/container-security-overrides.yaml ..."
+
+  # ── EKS cluster ───────────────────────────────
+
   ClusterName:
     Description: EKS cluster name
     Value: !Ref EksCluster
 
+  ClusterVersion:
+    Description: Kubernetes version
+    Value: !Ref EksVersion
+
+  NodeInstanceType:
+    Description: EKS node instance type
+    Value: !Ref NodeInstanceType
+
+  # ── Bootstrap EC2 ─────────────────────────────
+
+  BootstrapPublicIp:
+    Description: Elastic IP of the bootstrap EC2 (same IP as AppUrl and OllamaApiUrl)
+    Value: !Ref BootstrapEip
+
   BootstrapInstanceId:
-    Description: Bootstrap EC2 instance ID — use for SSM Session Manager
+    Description: Bootstrap EC2 instance ID
     Value: !Ref BootstrapInstance
 
+  # ── CLI commands ──────────────────────────────
+
   SsmConnectCommand:
-    Description: Open a shell on the bootstrap node (kubectl pre-configured)
+    Description: Open a shell on the bootstrap EC2 (kubectl + helper scripts pre-configured)
     Value: !Sub aws ssm start-session --target ${BootstrapInstance}
 
-  GetAppUrlCommand:
-    Description: Command to retrieve the app LoadBalancer URL after deploy
-    Value: !Sub >-
-      aws ssm start-session
-      --target ${BootstrapInstance}
-      --document-name AWS-StartInteractiveCommand
-      --parameters command="kubectl get svc trendai-app -n trendai-lab -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'"
-
   KubeconfigCommand:
-    Description: Configure local kubectl to connect to the cluster
+    Description: Configure your local kubectl to connect to this cluster
+    Value: !Sub aws eks update-kubeconfig --region ${AWS::Region} --name trendai-aisec-${ParticipantName}
+
+  CheckPodsCommand:
+    Description: Verify all lab pods are running
     Value: !Sub >-
-      aws eks update-kubeconfig
-      --region ${AWS::Region}
-      --name trendai-aisec-${ParticipantName}
+      aws ssm start-session --target ${BootstrapInstance}
+      --document-name AWS-StartInteractiveCommand
+      --parameters command="kubectl get pods -n trendai-lab && kubectl get pods -n trendmicro-system"
 
   AiScanCommand:
-    Description: Run the AI Scanner (from bootstrap EC2 via SSM)
+    Description: Run the Vision One AI Scanner against the raw Ollama API
     Value: !Sub >-
-      aws ssm start-session
-      --target ${BootstrapInstance}
+      aws ssm start-session --target ${BootstrapInstance}
       --document-name AWS-StartInteractiveCommand
       --parameters command="ai-scan"
 
-  ContainerAttackCommand:
-    Description: Run the container attack simulation
+  AiScanFullCommand:
+    Description: Run the full AI Scanner (all OWASP LLM Top 10 phases)
     Value: !Sub >-
-      aws ssm start-session
-      --target ${BootstrapInstance}
+      aws ssm start-session --target ${BootstrapInstance}
+      --document-name AWS-StartInteractiveCommand
+      --parameters command="ai-scan --full"
+
+  ContainerAttackCommand:
+    Description: Run the container runtime attack simulation (generates Container Security detections)
+    Value: !Sub >-
+      aws ssm start-session --target ${BootstrapInstance}
       --document-name AWS-StartInteractiveCommand
       --parameters command="cs-attack"
+
+  PortForwardStatusCommand:
+    Description: Check the port-forward systemd services (app + Ollama)
+    Value: !Sub >-
+      aws ssm start-session --target ${BootstrapInstance}
+      --document-name AWS-StartInteractiveCommand
+      --parameters command="systemctl status kubectl-pf-app kubectl-pf-ollama"
+
+  TeardownCommand:
+    Description: Delete this stack and all resources
+    Value: !Sub aws cloudformation delete-stack --stack-name trendai-aisec-${ParticipantName}

@@ -260,12 +260,32 @@ get_output() {
     --output text 2>/dev/null || echo ""
 }
 
+APP_URL=$(get_output "AppUrl")
+OLLAMA_API_URL=$(get_output "OllamaApiUrl")
+OLLAMA_MODEL=$(get_output "OllamaModel")
+V1_REGION_OUT=$(get_output "V1Region")
+V1_GUARD_ENDPOINT=$(get_output "V1GuardEndpoint")
+CLUSTER_NAME_OUT=$(get_output "ClusterName")
+CLUSTER_VERSION=$(get_output "ClusterVersion")
+NODE_TYPE_OUT=$(get_output "NodeInstanceType")
+BOOTSTRAP_PUBLIC_IP=$(get_output "BootstrapPublicIp")
 BOOTSTRAP_INSTANCE_ID=$(get_output "BootstrapInstanceId")
 SSM_CONNECT=$(get_output "SsmConnectCommand")
 KUBECONFIG_CMD=$(get_output "KubeconfigCommand")
+CS_STATUS=$(get_output "ContainerSecurityStatus")
 
-ok "Bootstrap instance ID : $BOOTSTRAP_INSTANCE_ID"
-ok "Kubeconfig command    : $KUBECONFIG_CMD"
+echo ""
+echo -e "  ${BOLD}Stack outputs:${NC}"
+echo -e "  App URL              : ${GREEN}$APP_URL${NC}"
+echo -e "  Ollama API URL       : ${GREEN}$OLLAMA_API_URL${NC}"
+echo -e "  Ollama model         : $OLLAMA_MODEL"
+echo -e "  V1 region            : $V1_REGION_OUT"
+echo -e "  V1 Guard endpoint    : $V1_GUARD_ENDPOINT"
+echo -e "  Cluster name         : $CLUSTER_NAME_OUT (k8s $CLUSTER_VERSION)"
+echo -e "  Node type            : $NODE_TYPE_OUT"
+echo -e "  Bootstrap public IP  : $BOOTSTRAP_PUBLIC_IP"
+echo -e "  Bootstrap instance   : $BOOTSTRAP_INSTANCE_ID"
+echo -e "  Container Security   : $CS_STATUS"
 
 # ── Configure local kubectl ───────────────────────────────────────────────────
 hdr "Step 5 — Configuring local kubectl"
@@ -426,50 +446,50 @@ else
   info "GitHub Actions setup skipped."
 fi
 
-# ── Get app URL ───────────────────────────────────────────────────────────────
-hdr "Step ${SKIP_GHA:+8}${SKIP_GHA:-9} — App URL"
+# ── Wait for app to respond ───────────────────────────────────────────────────
+hdr "Step ${SKIP_GHA:+8}${SKIP_GHA:-9} — Verify app is reachable"
 
-info "Waiting for LoadBalancer hostname..."
-APP_URL=""
-for i in $(seq 1 20); do
-  LB=$(kubectl get svc trendai-app -n trendai-lab \
-    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-  if [ -n "$LB" ]; then
-    APP_URL="http://$LB:8000"
-    ok "App URL: $APP_URL"
-    break
-  fi
-  printf "\r  waiting for NLB hostname (attempt %d/20, 15s)..." "$i"
-  sleep 15
-done
-echo ""
-
-if [ -z "$APP_URL" ]; then
-  warn "LoadBalancer hostname not yet assigned. Check later with:"
-  warn "  kubectl get svc trendai-app -n trendai-lab"
-fi
-
-# Wait for app to respond
 if [ -n "$APP_URL" ]; then
   info "Waiting for app to respond at $APP_URL..."
-  for i in $(seq 1 20); do
+  for i in $(seq 1 24); do
     if curl -sf --max-time 5 "$APP_URL/" >/dev/null 2>&1; then
-      ok "App is responding!"; break
+      ok "App is live at $APP_URL"; break
     fi
-    printf "\r  attempt %d/20 (NLB DNS may need up to 2 min to propagate)..." "$i"
-    sleep 10
+    printf "\r  attempt %d/24 — port-forward may still be starting (15s)..." "$i"
+    sleep 15
   done
   echo ""
+
+  info "Waiting for Ollama API at $OLLAMA_API_URL..."
+  for i in $(seq 1 12); do
+    if curl -sf --max-time 5 "$OLLAMA_API_URL/api/tags" >/dev/null 2>&1; then
+      ok "Ollama API is live at $OLLAMA_API_URL"; break
+    fi
+    printf "\r  attempt %d/12 (15s)..." "$i"
+    sleep 15
+  done
+  echo ""
+else
+  warn "Could not read AppUrl from stack outputs — check AWS Console > CloudFormation > Outputs"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 hdr "🎉  Deployment complete"
 
 echo ""
-echo -e "  ${BOLD}Stack name      :${NC} $STACK_NAME"
-echo -e "  ${BOLD}EKS cluster     :${NC} $CLUSTER_NAME"
-echo -e "  ${BOLD}App URL         :${NC} ${APP_URL:-run: kubectl get svc trendai-app -n trendai-lab}"
-echo -e "  ${BOLD}Bootstrap EC2   :${NC} $BOOTSTRAP_INSTANCE_ID"
+echo -e "  ${BOLD}Stack name          :${NC} $STACK_NAME"
+echo -e "  ${BOLD}EKS cluster         :${NC} $CLUSTER_NAME_OUT"
+echo -e "  ${BOLD}Kubernetes version  :${NC} $CLUSTER_VERSION"
+echo -e "  ${BOLD}Node type           :${NC} $NODE_TYPE_OUT"
+echo ""
+echo -e "  ${GREEN}${BOLD}App URL             :${NC} ${GREEN}$APP_URL${NC}  ← open in browser"
+echo -e "  ${GREEN}${BOLD}Ollama API URL      :${NC} ${GREEN}$OLLAMA_API_URL${NC}"
+echo -e "  ${BOLD}Ollama model        :${NC} $OLLAMA_MODEL"
+echo -e "  ${BOLD}V1 region           :${NC} $V1_REGION_OUT"
+echo -e "  ${BOLD}V1 Guard endpoint   :${NC} $V1_GUARD_ENDPOINT"
+echo -e "  ${BOLD}Bootstrap public IP :${NC} $BOOTSTRAP_PUBLIC_IP"
+echo -e "  ${BOLD}Bootstrap instance  :${NC} $BOOTSTRAP_INSTANCE_ID"
+echo -e "  ${BOLD}Container Security  :${NC} $CS_STATUS"
 echo ""
 echo -e "  ${BOLD}Useful commands:${NC}"
 echo ""
