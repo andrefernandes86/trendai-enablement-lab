@@ -1,0 +1,6 @@
+.claude/
+*.swp
+*.bak
+.DS_Store
+__pycache__/
+*.pyc

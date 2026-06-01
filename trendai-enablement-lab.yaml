@@ -1,0 +1,956 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  TrendAI / Trend Vision One enablement lab - deploy one stack per participant
+  with a unique ParticipantName. VPC1 is the attacker (1 Ubuntu with emulation
+  tooling). VPC2 is the protected estate (1 Windows + 2 Ubuntu targets plus a
+  Deep Discovery Inspector appliance fed by AWS VPC Traffic Mirroring). The two
+  VPCs are peered so VPC1 attacks VPC2; SSH/RDP/SMB on VPC2 are open only to the
+  VPC1 subnet, never the internet. Workload access is via SSM Session Manager.
+  Only 2 Elastic IPs per stack. Prerequisites: raise VPC and Elastic IP per-region
+  quotas to at least 2x participants, subscribe to DDI in AWS Marketplace for the
+  AMI ID, have a Vision One tenant with enrollment tokens. See the runbook and the
+  attack playbook for the full flow.
+
+Parameters:
+  ParticipantName:
+    Type: String
+    AllowedPattern: "[a-zA-Z0-9-]{2,20}"
+    Description: Short unique name for this participant (e.g. jdoe). Used in tags and resource names.
+
+  UserName:
+    Type: String
+    Default: trendai
+    Description: Local user created on the standard VMs at first boot.
+
+  UserPassword:
+    Type: String
+    Default: "Trend@00p$"
+    NoEcho: true
+    Description: Password for the local user. Override at deploy time if you prefer.
+
+  AdminCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    Description: >
+      Your public IP as a /32, used only to reach the DDI management console.
+      Workload VMs are reached via SSM Session Manager and need no inbound rule.
+
+  StandardInstanceType:
+    Type: String
+    Default: c5.xlarge
+    Description: 4 vCPU / 8 GiB, Nitro-based (required for Traffic Mirroring sources).
+
+  DdiInstanceType:
+    Type: String
+    Default: m5.2xlarge
+    Description: Size per your licensed DDI throughput model.
+
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+  WindowsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+  DdiAmiId:
+    Type: String
+    Default: ami-09efe0d9de322e018
+    Description: >
+      DDI AMI ID from your AWS Marketplace subscription (region specific).
+      Default is Trend Micro Deep Discovery Inspector 6.82.1048 in us-east-1.
+      Leave blank to deploy the lab without the DDI appliance and traffic mirroring.
+
+Conditions:
+  HasDdi: !Not [!Equals [!Ref DdiAmiId, ""]]
+
+Resources:
+
+  # ---- IAM: SSM access for all standard VMs (no SSH/RDP inbound needed) ----
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: LabScriptsS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: arn:aws:s3:::cf-templates-19r23id7c3eko-us-east-1/lab/*
+      Tags:
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref InstanceRole ]
+
+  # =========================================================================
+  # VPC 1 - single Ubuntu endpoint target (public subnet, free public IP)
+  # =========================================================================
+  Vpc1:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc1"
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  Vpc1Igw:
+    Type: AWS::EC2::InternetGateway
+
+  Vpc1IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc1
+      InternetGatewayId: !Ref Vpc1Igw
+
+  Vpc1Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc1
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  Vpc1RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc1
+
+  Vpc1DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: Vpc1IgwAttach
+    Properties:
+      RouteTableId: !Ref Vpc1RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Vpc1Igw
+
+  Vpc1SubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Vpc1Subnet
+      RouteTableId: !Ref Vpc1RouteTable
+
+  Vpc1Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC1 - intra-VPC allowed, optional admin SSH, egress open
+      VpcId: !Ref Vpc1
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+
+  Vpc1Ubuntu:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref StandardInstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref Vpc1Subnet
+          GroupSet: [ !Ref Vpc1Sg ]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #cloud-config
+            ssh_pwauth: true
+            package_update: true
+            packages:
+              - nmap
+              - hydra
+              - smbclient
+              - sshpass
+              - python3-pip
+              - ruby
+              - ruby-dev
+              - git
+              - curl
+              - wordlists
+              - dnsutils
+              - netcat-openbsd
+              - awscli
+            users:
+              - default
+              - name: ${UserName}
+                groups: [sudo]
+                shell: /bin/bash
+                sudo: 'ALL=(ALL) NOPASSWD:ALL'
+                lock_passwd: false
+            chpasswd:
+              expire: false
+              users:
+                - name: ${UserName}
+                  password: '${UserPassword}'
+                  type: text
+            write_files:
+              - path: /opt/lab/lab.conf
+                permissions: '0644'
+                content: |
+                  WIN_IP="${WinIp}"
+                  U1_IP="${U1Ip}"
+                  U2_IP="${U2Ip}"
+                  LAB_USER="${UserName}"
+                  LAB_PASS='${UserPassword}'
+                  DELAY=30
+              - path: /opt/lab/bootstrap.sh
+                permissions: '0755'
+                content: |
+                  #!/bin/bash
+                  exec >> /var/log/lab-bootstrap.log 2>&1
+                  echo "=== Bootstrap started $(date) ==="
+                  export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+                  echo 'export PATH=/usr/local/bin:$PATH' > /etc/profile.d/lab.sh
+                  chmod 644 /etc/profile.d/lab.sh
+                  echo "--- Installing AWS CLI v2 ---"
+                  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+                  unzip -q /tmp/awscliv2.zip -d /tmp/ && /tmp/aws/install --update && export PATH=/usr/local/bin:$PATH
+                  echo "--- Installing python3-venv ---"
+                  apt-get install -y python3-venv -q
+                  echo "--- Creating venv and installing tools ---"
+                  python3 -m venv /opt/lab/venv
+                  /opt/lab/venv/bin/pip install -q impacket
+                  /opt/lab/venv/bin/pip install -q git+https://github.com/Pennyw0rth/NetExec.git || true
+                  echo "--- Symlinking tools to /usr/local/bin ---"
+                  for s in /opt/lab/venv/bin/nxc /opt/lab/venv/bin/wmiexec.py /opt/lab/venv/bin/psexec.py /opt/lab/venv/bin/secretsdump.py /opt/lab/venv/bin/smbclient.py /opt/lab/venv/bin/GetNPUsers.py; do
+                    [ -f $s ] && ln -sf $s /usr/local/bin/$(basename $s) && echo linked $(basename $s) || true
+                  done
+                  echo "--- Installing evil-winrm ---"
+                  gem install evil-winrm --no-document
+                  echo "--- Downloading rockyou wordlist ---"
+                  mkdir -p /usr/share/wordlists
+                  curl -fsSL "https://github.com/danielmiessler/SecLists/raw/master/Passwords/Leaked-Databases/rockyou-75.txt" -o /usr/share/wordlists/rockyou.txt || true
+                  echo "--- Lab dirs ---"
+                  mkdir -p /opt/lab/loot && chmod 1777 /opt/lab/loot
+                  echo "--- Downloading lab scripts from S3 ---"
+                  aws s3 cp s3://cf-templates-19r23id7c3eko-us-east-1/lab/attack.sh /opt/lab/attack.sh
+                  aws s3 cp s3://cf-templates-19r23id7c3eko-us-east-1/lab/ransom_sim.ps1 /opt/lab/ransom_sim.ps1
+                  chmod +x /opt/lab/attack.sh
+                  ln -sf /opt/lab/attack.sh /usr/local/bin/attack
+                  echo "--- Verifying tools ---"
+                  for t in aws nxc wmiexec.py psexec.py secretsdump.py smbclient.py evil-winrm hydra nmap; do
+                    command -v $t &>/dev/null && echo "OK $t" || echo "MISSING $t"
+                  done
+                  echo "--- Installing Metasploit ---"
+                  curl -fsSL https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb -o /tmp/msfinstall
+                  chmod +x /tmp/msfinstall && /tmp/msfinstall || true
+                  echo "=== Bootstrap complete $(date) ==="
+            runcmd:
+              - /opt/lab/bootstrap.sh
+          - WinIp: !GetAtt WinEni.PrimaryPrivateIpAddress
+            U1Ip: !GetAtt Ubuntu1Eni.PrimaryPrivateIpAddress
+            U2Ip: !GetAtt Ubuntu2Eni.PrimaryPrivateIpAddress
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc1-attacker"
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  # =========================================================================
+  # Cross-VPC peering: VPC1 (attacker) <-> VPC2 (protected estate)
+  # =========================================================================
+  Vpc1ToVpc2Peering:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      VpcId: !Ref Vpc1
+      PeerVpcId: !Ref Vpc2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc1-to-vpc2"
+
+  Vpc1ToVpc2Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref Vpc1RouteTable
+      DestinationCidrBlock: 10.1.0.0/16
+      VpcPeeringConnectionId: !Ref Vpc1ToVpc2Peering
+
+  Vpc2PrivateToVpc1Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref Vpc2PrivateRt
+      DestinationCidrBlock: 10.0.0.0/16
+      VpcPeeringConnectionId: !Ref Vpc1ToVpc2Peering
+
+  Vpc2PublicToVpc1Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref Vpc2PublicRt
+      DestinationCidrBlock: 10.0.0.0/16
+      VpcPeeringConnectionId: !Ref Vpc1ToVpc2Peering
+
+  # =========================================================================
+  # VPC 2 - Windows + 2 Ubuntu + DDI. Public subnet (NAT + DDI mgmt),
+  #          private subnet (workloads, no internet inbound).
+  # =========================================================================
+  Vpc2:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc2"
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  Vpc2Igw:
+    Type: AWS::EC2::InternetGateway
+
+  Vpc2IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc2
+      InternetGatewayId: !Ref Vpc2Igw
+
+  Vpc2PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc2
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+
+  Vpc2PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc2
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+
+  Vpc2PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc2
+
+  Vpc2PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: Vpc2IgwAttach
+    Properties:
+      RouteTableId: !Ref Vpc2PublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Vpc2Igw
+
+  Vpc2PublicAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Vpc2PublicSubnet
+      RouteTableId: !Ref Vpc2PublicRt
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref Vpc2PublicSubnet
+
+  Vpc2PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc2
+
+  Vpc2PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref Vpc2PrivateRt
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  Vpc2PrivateAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Vpc2PrivateSubnet
+      RouteTableId: !Ref Vpc2PrivateRt
+
+  # Workload SG: intra-VPC allowed (covers lateral movement + VXLAN 4789 mirror).
+  # SSH/RDP/SMB are exposed ONLY to the VPC1 attacker subnet (10.0.0.0/16),
+  # never to the internet. Egress open (NAT for agent enrollment + SSM).
+  WorkloadSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC2 workloads - intra-VPC plus attacker-VPC SSH/RDP/SMB, egress open
+      VpcId: !Ref Vpc2
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: 10.1.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 139
+          ToPort: 139
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 5985
+          ToPort: 5986
+          CidrIp: 10.0.0.0/16
+
+  DdiMgmtSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DDI management console - admin CIDR only
+      VpcId: !Ref Vpc2
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AdminCidr
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+
+  # ---- Explicit ENIs for the 3 mirror sources (in private subnet) ----
+  WinEni:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref Vpc2PrivateSubnet
+      GroupSet: [ !Ref WorkloadSg ]
+      Description: !Sub "${ParticipantName} windows mirror source"
+
+  Ubuntu1Eni:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref Vpc2PrivateSubnet
+      GroupSet: [ !Ref WorkloadSg ]
+      Description: !Sub "${ParticipantName} ubuntu-1 mirror source"
+
+  Ubuntu2Eni:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref Vpc2PrivateSubnet
+      GroupSet: [ !Ref WorkloadSg ]
+      Description: !Sub "${ParticipantName} ubuntu-2 mirror source / test-runner"
+
+  Vpc2Windows:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref WindowsAmiId
+      InstanceType: !Ref StandardInstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId: !Ref WinEni
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          # ── Users ──────────────────────────────────────────────────────────
+          $securePass = ConvertTo-SecureString '${UserPassword}' -AsPlainText -Force
+          if (-not (Get-LocalUser -Name '${UserName}')) {
+            New-LocalUser -Name '${UserName}' -Password $securePass -PasswordNeverExpires -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name '${UserName}' -Password $securePass
+          }
+          Add-LocalGroupMember -Group 'Administrators' -Member '${UserName}'
+          Set-LocalUser -Name 'Administrator' -Password $securePass
+          Enable-LocalUser -Name 'Administrator'
+
+          # ── Weak account policy ────────────────────────────────────────────
+          net accounts /minpwlen:0 /maxpwage:unlimited /minpwage:0 /lockoutthreshold:0
+
+          # ── Disable Windows Firewall (all profiles) ────────────────────────
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+          netsh advfirewall set allprofiles state off
+
+          # ── Disable Windows Defender ───────────────────────────────────────
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-MpPreference -DisableIOAVProtection $true
+          Set-MpPreference -DisableBehaviorMonitoring $true
+          Set-MpPreference -DisableBlockAtFirstSeen $true
+          Set-MpPreference -DisableScriptScanning $true
+          Set-MpPreference -DisableArchiveScanning $true
+          Set-MpPreference -DisableEmailScanning $true
+          Set-MpPreference -MAPSReporting Disabled
+          Set-MpPreference -SubmitSamplesConsent NeverSend
+          Add-MpPreference -ExclusionPath 'C:\'
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name 'DisableAntiSpyware' -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -Name 'DisableRealtimeMonitoring' -Value 1 -Type DWord -Force
+          New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Force | Out-Null
+          New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -Name 'DisableAntiSpyware' -Value 1 -Type DWord
+
+          # ── Disable UAC ────────────────────────────────────────────────────
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'EnableLUA' -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'ConsentPromptBehaviorAdmin' -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'PromptOnSecureDesktop' -Value 0 -Type DWord
+
+          # ── Enable LocalAccountTokenFilterPolicy (pass-the-hash) ──────────
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'LocalAccountTokenFilterPolicy' -Value 1 -Type DWord
+
+          # ── Enable WDigest (plaintext creds in memory for secretsdump) ─────
+          New-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name 'UseLogonCredential' -Value 1 -Type DWord
+
+          # ── Disable LSA Protection ─────────────────────────────────────────
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'RunAsPPL' -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'LmCompatibilityLevel' -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'NoLMHash' -Value 0 -Type DWord
+
+          # ── Enable Admin shares (C$, ADMIN$) ──────────────────────────────
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'AutoShareWks' -Value 1 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'AutoShareServer' -Value 1 -Type DWord
+
+          # ── Disable SMB signing (enables SMB relay) ────────────────────────
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'RequireSecuritySignature' -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'EnableSecuritySignature' -Value 0 -Type DWord
+          Set-SmbServerConfiguration -RequireSecuritySignature $false -EnableSecuritySignature $false -Force
+
+          # ── Enable SMBv1 (legacy exploit compatibility) ────────────────────
+          Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force
+          Enable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart
+
+          # ── Disable NLA for RDP (allows direct credential attacks) ─────────
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          # ── WinRM ──────────────────────────────────────────────────────────
+          winrm quickconfig -force
+          winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+          winrm set winrm/config/service/auth '@{Basic="true"}'
+          winrm set winrm/config/client '@{AllowUnencrypted="true"}'
+          Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true
+          Set-Item WSMan:\localhost\Service\Auth\Basic -Value $true
+
+          # ── Disable Windows Update ─────────────────────────────────────────
+          Set-Service wuauserv -StartupType Disabled
+          Stop-Service wuauserv -Force
+
+          # ── Disable Windows Defender services via registry ─────────────────
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WinDefend' -Name 'Start' -Value 4 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WdNisSvc' -Name 'Start' -Value 4 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Sense' -Name 'Start' -Value 4 -Type DWord
+
+          # ── Enable NetBIOS over TCP/IP ─────────────────────────────────────
+          $adapters = Get-WmiObject Win32_NetworkAdapterConfiguration
+          foreach ($adapter in $adapters) { $adapter.SetTcpipNetbios(1) }
+
+          Write-Host 'Lab configuration complete'
+          </powershell>
+          <persist>true</persist>
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc2-windows"
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  Vpc2Ubuntu1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref StandardInstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId: !Ref Ubuntu1Eni
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #cloud-config
+          ssh_pwauth: true
+          users:
+            - default
+            - name: ${UserName}
+              groups: [sudo]
+              shell: /bin/bash
+              sudo: 'ALL=(ALL) NOPASSWD:ALL'
+              lock_passwd: false
+          chpasswd:
+            expire: false
+            users:
+              - name: ${UserName}
+                password: '${UserPassword}'
+                type: text
+          runcmd:
+            - echo 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+            - echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+            - echo 'PermitEmptyPasswords yes' >> /etc/ssh/sshd_config
+            - systemctl enable ssh && systemctl restart ssh
+            - ufw disable || true
+            - systemctl disable apparmor && systemctl stop apparmor || true
+            - apt-get install -y python3-venv sshpass -q
+            - python3 -m venv /opt/lab/venv
+            - /opt/lab/venv/bin/pip install -q impacket
+            - /opt/lab/venv/bin/pip install -q git+https://github.com/Pennyw0rth/NetExec.git || true
+            - for s in /opt/lab/venv/bin/nxc /opt/lab/venv/bin/wmiexec.py /opt/lab/venv/bin/psexec.py /opt/lab/venv/bin/secretsdump.py /opt/lab/venv/bin/smbclient.py; do [ -f $s ] && ln -sf $s /usr/local/bin/$(basename $s); done
+            - echo 'export PATH=/usr/local/bin:$PATH' > /etc/profile.d/lab.sh
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc2-ubuntu-1"
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  Vpc2Ubuntu2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref StandardInstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId: !Ref Ubuntu2Eni
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #cloud-config
+          ssh_pwauth: true
+          packages:
+            - docker.io
+            - docker-compose-v2
+            - git
+          users:
+            - default
+            - name: ${UserName}
+              groups: [sudo, docker]
+              shell: /bin/bash
+              sudo: 'ALL=(ALL) NOPASSWD:ALL'
+              lock_passwd: false
+          chpasswd:
+            expire: false
+            users:
+              - name: ${UserName}
+                password: '${UserPassword}'
+                type: text
+          runcmd:
+            - echo 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+            - echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+            - echo 'PermitEmptyPasswords yes' >> /etc/ssh/sshd_config
+            - systemctl enable ssh && systemctl restart ssh
+            - ufw disable || true
+            - systemctl disable apparmor && systemctl stop apparmor || true
+            - systemctl enable --now docker || true
+            - git clone --depth 1 https://github.com/vulhub/vulhub /opt/lab/vulhub || true
+            - chown -R ${UserName}:${UserName} /opt/lab/vulhub || true
+            - apt-get install -y python3-venv sshpass -q
+            - python3 -m venv /opt/lab/venv
+            - /opt/lab/venv/bin/pip install -q impacket
+            - /opt/lab/venv/bin/pip install -q git+https://github.com/Pennyw0rth/NetExec.git || true
+            - for s in /opt/lab/venv/bin/nxc /opt/lab/venv/bin/wmiexec.py /opt/lab/venv/bin/psexec.py /opt/lab/venv/bin/secretsdump.py /opt/lab/venv/bin/smbclient.py; do [ -f $s ] && ln -sf $s /usr/local/bin/$(basename $s); done
+            - echo 'export PATH=/usr/local/bin:$PATH' > /etc/profile.d/lab.sh
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc2-ubuntu-2"
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  # ---- DDI appliance: data port eth0 (device 0) in private subnet,
+  #      management port eth1 (device 1) in public subnet with an EIP ----
+  DdiDataEni:
+    Type: AWS::EC2::NetworkInterface
+    Condition: HasDdi
+    Properties:
+      SubnetId: !Ref Vpc2PrivateSubnet
+      GroupSet: [ !Ref WorkloadSg ]
+      Description: !Sub "${ParticipantName} ddi data port (mirror target)"
+
+  DdiMgmtEni:
+    Type: AWS::EC2::NetworkInterface
+    Condition: HasDdi
+    Properties:
+      SubnetId: !Ref Vpc2PublicSubnet
+      GroupSet: [ !Ref DdiMgmtSg ]
+      Description: !Sub "${ParticipantName} ddi management port"
+
+  DdiMgmtEip:
+    Type: AWS::EC2::EIP
+    Condition: HasDdi
+    Properties:
+      Domain: vpc
+
+  DdiMgmtEipAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Condition: HasDdi
+    Properties:
+      AllocationId: !GetAtt DdiMgmtEip.AllocationId
+      NetworkInterfaceId: !Ref DdiMgmtEni
+
+  DdiAppliance:
+    Type: AWS::EC2::Instance
+    Condition: HasDdi
+    Properties:
+      ImageId: !Ref DdiAmiId
+      InstanceType: !Ref DdiInstanceType
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId: !Ref DdiDataEni
+        - DeviceIndex: 1
+          NetworkInterfaceId: !Ref DdiMgmtEni
+      Tags:
+        - Key: Name
+          Value: !Sub "${ParticipantName}-vpc2-ddi"
+        - Key: Participant
+          Value: !Ref ParticipantName
+
+  # ---- Traffic Mirroring: 3 sources -> DDI data port, all traffic ----
+  DdiMirrorTarget:
+    Type: AWS::EC2::TrafficMirrorTarget
+    Condition: HasDdi
+    DependsOn: DdiAppliance
+    Properties:
+      NetworkInterfaceId: !Ref DdiDataEni
+      Description: DDI data port mirror target
+
+  DdiMirrorFilter:
+    Type: AWS::EC2::TrafficMirrorFilter
+    Condition: HasDdi
+    Properties:
+      Description: Mirror all traffic
+
+  DdiMirrorRuleIn:
+    Type: AWS::EC2::TrafficMirrorFilterRule
+    Condition: HasDdi
+    Properties:
+      TrafficMirrorFilterId: !Ref DdiMirrorFilter
+      TrafficDirection: ingress
+      RuleNumber: 100
+      RuleAction: accept
+      SourceCidrBlock: 0.0.0.0/0
+      DestinationCidrBlock: 0.0.0.0/0
+
+  DdiMirrorRuleOut:
+    Type: AWS::EC2::TrafficMirrorFilterRule
+    Condition: HasDdi
+    Properties:
+      TrafficMirrorFilterId: !Ref DdiMirrorFilter
+      TrafficDirection: egress
+      RuleNumber: 100
+      RuleAction: accept
+      SourceCidrBlock: 0.0.0.0/0
+      DestinationCidrBlock: 0.0.0.0/0
+
+  WinMirrorSession:
+    Type: AWS::EC2::TrafficMirrorSession
+    Condition: HasDdi
+    DependsOn: Vpc2Windows
+    Properties:
+      NetworkInterfaceId: !Ref WinEni
+      TrafficMirrorTargetId: !Ref DdiMirrorTarget
+      TrafficMirrorFilterId: !Ref DdiMirrorFilter
+      SessionNumber: 1
+
+  Ubuntu1MirrorSession:
+    Type: AWS::EC2::TrafficMirrorSession
+    Condition: HasDdi
+    DependsOn: Vpc2Ubuntu1
+    Properties:
+      NetworkInterfaceId: !Ref Ubuntu1Eni
+      TrafficMirrorTargetId: !Ref DdiMirrorTarget
+      TrafficMirrorFilterId: !Ref DdiMirrorFilter
+      SessionNumber: 2
+
+  Ubuntu2MirrorSession:
+    Type: AWS::EC2::TrafficMirrorSession
+    Condition: HasDdi
+    DependsOn: Vpc2Ubuntu2
+    Properties:
+      NetworkInterfaceId: !Ref Ubuntu2Eni
+      TrafficMirrorTargetId: !Ref DdiMirrorTarget
+      TrafficMirrorFilterId: !Ref DdiMirrorFilter
+      SessionNumber: 3
+
+Outputs:
+  # ── Instance IDs & IPs ────────────────────────────────────────────────────
+  AttackerInstanceId:
+    Description: "HOSTS | VPC1 attacker instance ID"
+    Value: !Ref Vpc1Ubuntu
+  AttackerPublicIp:
+    Description: "HOSTS | VPC1 attacker public IP (SSH from AdminCidr or use SSM)"
+    Value: !GetAtt Vpc1Ubuntu.PublicIp
+  Vpc2WindowsId:
+    Description: "HOSTS | VPC2 Windows target instance ID"
+    Value: !Ref Vpc2Windows
+  Vpc2Ubuntu1Id:
+    Description: "HOSTS | VPC2 Ubuntu-1 target instance ID"
+    Value: !Ref Vpc2Ubuntu1
+  Vpc2Ubuntu2Id:
+    Description: "HOSTS | VPC2 Ubuntu-2 target instance ID (vulhub test-runner)"
+    Value: !Ref Vpc2Ubuntu2
+  TargetWindowsPrivateIp:
+    Description: "HOSTS | VPC2 Windows private IP"
+    Value: !GetAtt WinEni.PrimaryPrivateIpAddress
+  TargetUbuntu1PrivateIp:
+    Description: "HOSTS | VPC2 Ubuntu-1 private IP"
+    Value: !GetAtt Ubuntu1Eni.PrimaryPrivateIpAddress
+  TargetUbuntu2PrivateIp:
+    Description: "HOSTS | VPC2 Ubuntu-2 private IP"
+    Value: !GetAtt Ubuntu2Eni.PrimaryPrivateIpAddress
+  DdiManagementPublicIp:
+    Condition: HasDdi
+    Description: "HOSTS | DDI management console public IP — open https://<ip> from AdminCidr"
+    Value: !Ref DdiMgmtEip
+  DdiDataPrivateIp:
+    Condition: HasDdi
+    Description: "HOSTS | DDI data port private IP (traffic mirror target)"
+    Value: !GetAtt DdiDataEni.PrimaryPrivateIpAddress
+
+  # ── PRE-LAB: DDI setup (complete BEFORE running any attack phase) ─────────
+  PreLab01ActivateLicense:
+    Condition: HasDdi
+    Description: "PRE-LAB 01 | Activate DDI license — log in to the DDI console and complete the activation wizard"
+    Value: !Sub "https://${DdiMgmtEip}  ->  Administration > Product License > Activate"
+
+  PreLab02IntegrateV1:
+    Condition: HasDdi
+    Description: "PRE-LAB 02 | Integrate DDI with Vision One — generate enrollment token in V1 and paste it in DDI"
+    Value: "Vision One: Marketplace > Trend Micro Products > Deep Discovery Inspector > Add Existing Product | DDI: Administration > Vision One Enrollment > Paste token > Enroll"
+
+  PreLab03EnableNetworkSensor:
+    Condition: HasDdi
+    Description: "PRE-LAB 03 | Activate DDI Network Sensor in Vision One — enables XDR network detections"
+    Value: "Vision One: Marketplace > Trend Micro Products > Network Sensor > Enable > select the enrolled DDI appliance"
+
+  PreLab04InstallAgentsWindows:
+    Description: "PRE-LAB 04 | Install Trend Agent (Server & Workload Protection) on Windows target via SSM"
+    Value: !Sub
+      - "aws ssm start-session --target ${WinId}  # then run the SWP Windows installer from your V1 tenant"
+      - WinId: !Ref Vpc2Windows
+
+  PreLab05InstallAgentsUbuntu1:
+    Description: "PRE-LAB 05 | Install Trend Agent (Server & Workload Protection) on Ubuntu-1 via SSM"
+    Value: !Sub
+      - "aws ssm start-session --target ${U1Id}  # then run the SWP Linux installer from your V1 tenant"
+      - U1Id: !Ref Vpc2Ubuntu1
+
+  PreLab06InstallAgentsUbuntu2:
+    Description: "PRE-LAB 06 | Install Trend Agent (Server & Workload Protection) on Ubuntu-2 via SSM"
+    Value: !Sub
+      - "aws ssm start-session --target ${U2Id}  # then run the SWP Linux installer from your V1 tenant"
+      - U2Id: !Ref Vpc2Ubuntu2
+
+  PreLab07ConfigurePolicies:
+    Description: "PRE-LAB 07 | Configure SWP agent policies in Vision One before starting attacks"
+    Value: "Vision One: Endpoint Security > Server & Workload Protection > Policies | Enable: Anti-Malware (Real-Time), IPS (Prevent mode), Log Inspection, Integrity Monitoring > Assign policy to all 3 lab endpoints"
+
+  PreLab08VerifySetup:
+    Description: "PRE-LAB 08 | Verify all components are online before starting the attack phases"
+    Value: "Vision One: Endpoint Security > Endpoints (confirm 3 agents Connected) | Network Security > Network Sensor (confirm DDI status Active) | Only proceed to attack phases when all are green"
+
+  # ── Attack phases (run from the attacker host via SSM) ───────────────────
+  Step01ConnectAttacker:
+    Description: "STEP 01 | Open a shell on the attacker host via SSM Session Manager"
+    Value: !Sub "aws ssm start-session --target ${Vpc1Ubuntu}"
+
+  Step02RunPlaybook:
+    Description: "STEP 02 | Launch the interactive attack menu (all 13 phases)"
+    Value: "attack   # or: /opt/lab/attack.sh"
+
+  Step03Recon:
+    Description: "STEP 03 | Phase 1 — Network Discovery: port-scan all three VPC2 targets"
+    Value: !Sub
+      - "nmap -Pn -sV --top-ports 1000 ${WinIp} ${U1Ip} ${U2Ip}"
+      - WinIp: !GetAtt WinEni.PrimaryPrivateIpAddress
+        U1Ip: !GetAtt Ubuntu1Eni.PrimaryPrivateIpAddress
+        U2Ip: !GetAtt Ubuntu2Eni.PrimaryPrivateIpAddress
+
+  Step04EnumSmb:
+    Description: "STEP 04 | Phase 1 — Enumerate SMB shares on the Windows target"
+    Value: !Sub
+      - "nxc smb ${WinIp} --shares -u '' -p ''"
+      - WinIp: !GetAtt WinEni.PrimaryPrivateIpAddress
+
+  Step05BruteForce:
+    Description: "STEP 05 | Phase 2 — Credential brute-force SSH on Ubuntu-1"
+    Value: !Sub
+      - "hydra -l trendai -P /usr/share/wordlists/rockyou.txt ssh://${U1Ip} -t 4"
+      - U1Ip: !GetAtt Ubuntu1Eni.PrimaryPrivateIpAddress
+
+  Step06LateralWin:
+    Description: "STEP 06 | Phase 2 — Lateral movement to Windows via SMB"
+    Value: !Sub
+      - "nxc smb ${WinIp} -u ${UserName} -p '${UserPassword}' --exec-method smbexec -x whoami"
+      - WinIp: !GetAtt WinEni.PrimaryPrivateIpAddress
+
+  Step07WmiExec:
+    Description: "STEP 07 | Phase 2 — Remote execution on Windows via WMI (impacket)"
+    Value: !Sub
+      - "wmiexec.py ${UserName}:'${UserPassword}'@${WinIp} whoami"
+      - WinIp: !GetAtt WinEni.PrimaryPrivateIpAddress
+
+  Step08EvilWinrm:
+    Description: "STEP 08 | Phase 2 — Interactive Windows shell via Evil-WinRM"
+    Value: !Sub
+      - "evil-winrm -i ${WinIp} -u ${UserName} -p '${UserPassword}'"
+      - WinIp: !GetAtt WinEni.PrimaryPrivateIpAddress
+
+  Step09VulnExploit:
+    Description: "STEP 09 | Phase 3 — Launch Log4Shell exploit container on Ubuntu-2"
+    Value: !Sub
+      - "ssh trendai@${U2Ip}  # then: cd /opt/lab/vulhub/log4j/CVE-2021-44228 && docker compose up -d"
+      - U2Ip: !GetAtt Ubuntu2Eni.PrimaryPrivateIpAddress
+
+  Step10Metasploit:
+    Description: "STEP 10 | Phase 3 — Launch Metasploit console for payload delivery"
+    Value: "msfconsole -q"
+
+  Step11DdiConsole:
+    Condition: HasDdi
+    Description: "STEP 11 | Detection review — DDI management console: check Detected Threats dashboard"
+    Value: !Sub "https://${DdiMgmtEip}  ->  Detections > Detected Threats"
+
+  Step12VisionOne:
+    Description: "STEP 12 | Detection review — Vision One XDR: review workbench alerts and endpoint events"
+    Value: "https://portal.xdr.trendmicro.com  ->  XDR Threat Investigation > Workbench"
+
+  Step13Cleanup:
+    Description: "STEP 13 | Teardown — delete the entire stack when the lab is complete"
+    Value: !Sub "aws cloudformation delete-stack --stack-name ${AWS::StackName}"
