@@ -124,8 +124,20 @@ spec:
               apk add --no-cache curl jq python3 > /dev/null 2>&1
               cp /scripts/ai-scan /usr/local/bin/ai-scan
               chmod +x /usr/local/bin/ai-scan
-              echo "[+] ai-scanner pod ready. Run: kubectl exec -n trendai-lab deployment/ai-scanner -- ai-scan"
-              sleep infinity
+              echo "[+] ai-scanner ready. Running every 30 minutes. Reports in /tmp/scan-reports/"
+              # Wait for Ollama to be ready before first scan
+              until curl -sf http://ollama:11434/api/tags > /dev/null 2>&1; do
+                echo "[*] Waiting for Ollama..."; sleep 10
+              done
+              while true; do
+                echo ""
+                echo "========================================"
+                echo " Auto-scan starting: $(date -u)"
+                echo "========================================"
+                ai-scan
+                echo "[*] Next scan in 30 minutes ($(date -u -d '+30 minutes' 2>/dev/null || date -u -v+30M))"
+                sleep 1800
+              done
           volumeMounts:
             - name: scripts
               mountPath: /scripts
