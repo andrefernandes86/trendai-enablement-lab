@@ -45,7 +45,7 @@ data:
       RESP=$(curl -sf -X POST "$OLLAMA_URL/api/generate" \
         -H 'Content-Type: application/json' \
         -d "{\"model\":\"$MODEL\",\"prompt\":$(printf '%s' "$PROMPT" | jq -Rs .),\"stream\":false}" \
-        --max-time 45 2>/dev/null | jq -r '.response // "ERROR"' | tr '\n' ' ' | cut -c1-160)
+        --max-time 120 2>/dev/null | jq -r '.response // "ERROR"' | tr '\n' ' ' | cut -c1-160)
       printf "          -> %s\n\n" "$RESP"
       printf '{"label":"%s","response":"%s"}\n' "$LABEL" "$(printf '%s' "$RESP" | sed 's/"/\\"/g')" >> "$REPORT.lines"
     }
@@ -135,7 +135,7 @@ spec:
                 echo " Auto-scan starting: $(date -u)"
                 echo "========================================"
                 ai-scan
-                echo "[*] Next scan in 30 minutes ($(date -u -d '+30 minutes' 2>/dev/null || date -u -v+30M))"
+                echo "[*] Next scan in 30 minutes"
                 sleep 1800
               done
           volumeMounts:
