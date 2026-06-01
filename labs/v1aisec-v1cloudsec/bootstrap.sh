@@ -451,4 +451,45 @@ curl -sf http://localhost:8000/ >/dev/null 2>&1 \
   && echo "[+] App is responding on port 8000." \
   || echo "[!] App not yet responding — model may still be loading."
 
+# ── Install TMAS CLI ───────────────────────────────────────────────────────────
+echo "[*] Installing TrendAI Artifact Scanner (TMAS)..."
+curl -fsSL "https://ast-cli.xdr.trendmicro.com/tmas-cli/latest/tmas-cli_Linux_x86_64.tar.gz" \
+  | tar xz -C /usr/local/bin/ tmas 2>/dev/null \
+  && chmod +x /usr/local/bin/tmas \
+  && echo "[+] TMAS installed: $(tmas version 2>&1 | head -1)" \
+  || echo "[!] TMAS install failed — skipping AI Scanner auto-scan."
+
+# Copy the TMAS scan config from the cloned repo
+cp /opt/lab/repo/labs/v1aisec-v1cloudsec/k8s/tmas-llm-scan.yaml /opt/lab/tmas-llm-scan.yaml
+
+# ── TMAS LLM Scan — trigger once model is confirmed ready ─────────────────────
+if command -v tmas >/dev/null 2>&1 && [ -n "$V1_API_KEY" ]; then
+  echo "[*] Waiting for Ollama model to be ready before running TMAS scan..."
+  for i in $(seq 1 30); do
+    MODEL_READY=$(curl -sf http://localhost:11434/api/tags 2>/dev/null \
+      | grep -c 'llama3.2' || true)
+    [ "${MODEL_READY:-0}" -ge 1 ] && break
+    echo "  attempt $i — model not ready yet, waiting 20s..."
+    sleep 20
+  done
+
+  if [ "${MODEL_READY:-0}" -ge 1 ]; then
+    echo "[*] Model ready. Running TMAS LLM scan (71 attack probes)..."
+    TMAS_API_KEY="$V1_API_KEY" \
+    TARGET_API_KEY="none" \
+      tmas aiscan llm \
+        --config /opt/lab/tmas-llm-scan.yaml \
+        --region "$AWS_REGION" \
+        --output "json=/opt/lab/scan-reports/tmas-llm-$(date -u +%Y%m%dT%H%M%SZ).json" \
+        -y \
+      && echo "[+] TMAS LLM scan complete. Report in /opt/lab/scan-reports/" \
+      || echo "[!] TMAS scan exited non-zero — check /opt/lab/scan-reports/"
+  else
+    echo "[!] Model not ready after retries — TMAS scan skipped. Run manually:"
+    echo "    TMAS_API_KEY=\$V1_API_KEY TARGET_API_KEY=none tmas aiscan llm --config /opt/lab/tmas-llm-scan.yaml --region $AWS_REGION -y"
+  fi
+else
+  echo "[*] TMAS not available or no API key — skipping auto-scan."
+fi
+
 echo "=== Bootstrap complete ==="
