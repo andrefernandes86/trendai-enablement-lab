@@ -1,0 +1,43 @@
+name: Vision One Code Security
+
+# Scans this repo (trendai-enablement-lab) on every push to main and every PR.
+# Checks CloudFormation templates, Kubernetes manifests, shell scripts, and
+# Python tools for secrets, dependency CVEs, and malware.
+#
+# One-time setup: add TMAS_API_KEY as a repository secret.
+#   GitHub repo > Settings > Secrets and variables > Actions > New repository secret
+#   Name:  TMAS_API_KEY
+#   Value: your Vision One API key (AI Security / File Security scope)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  v1-code-scan:
+    name: Trend Vision One — Code Security Scan
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Scan with Vision One TMAS
+        uses: trendmicro/tmas-scan-action@v2
+        with:
+          version: '2'
+          vulnerabilitiesScan: true
+          secretsScan: true
+          malwareScan: true
+          artifact: dir:./repo
+          additionalArgs: --region=us-east-1
+          tmasApiKey: ${{ secrets.TMAS_API_KEY }}
+          githubToken: ${{ secrets.GITHUB_TOKEN }}

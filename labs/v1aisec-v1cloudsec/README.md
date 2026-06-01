@@ -116,8 +116,11 @@ on every push and pull request via a GitHub App integration.
 | **IaC misconfigurations** | `docker-compose.yml` — privileged flags, exposed ports |
 | **SAST (static analysis)** | `app.py` — injection sinks, unsafe deserialization |
 
-**How to connect:** Vision One > Code Security > Repositories > Add Repository > GitHub  
-**Scan results:** Code Security > Findings — grouped by severity and file
+**How it runs:** `.github/workflows/v1-code-security.yml` is committed to this repo
+(`trendai-enablement-lab`). It fires automatically on every push to `main` and every PR,
+scanning the CFN templates, K8s manifests, and scripts in this repo.
+**One-time setup:** add `TMAS_API_KEY` as a GitHub Actions secret on this repo.  
+**Scan results:** GitHub Actions tab > Vision One Code Security run logs + PR comments
 
 ---
 
@@ -221,7 +224,6 @@ AWS — single VPC, 2 AZs
 | `k8s/ollama.yaml` | Ollama Deployment, Service, PVC, and model-pull Job |
 | `k8s/app.yaml` | Demo app Deployment, ConfigMap, Secret, and NLB LoadBalancer Service |
 | `k8s/container-security-overrides.yaml` | Helm values template for Vision One Container Security |
-| `github-actions/v1-code-security.yml` | GitHub Actions workflow template — add to your demo repo fork |
 
 ---
 

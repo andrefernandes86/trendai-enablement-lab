@@ -22,7 +22,6 @@ hdr()  { echo -e "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━�
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE_FILE="$SCRIPT_DIR/trendai-aisec-lab.yaml"
-GHA_TEMPLATE="$SCRIPT_DIR/github-actions/v1-code-security.yml"
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 clear
@@ -38,7 +37,6 @@ PARTICIPANT_NAME=""
 V1_API_KEY=""
 V1_REGION="us-east-1"
 CS_TOKEN=""
-GITHUB_REPO_FORK=""
 NODE_TYPE="t3.xlarge"
 SKIP_GHA=false
 TEARDOWN=false
@@ -49,9 +47,7 @@ while [[ $# -gt 0 ]]; do
     --api-key)           V1_API_KEY="$2";       shift 2 ;;
     --region)            V1_REGION="$2";        shift 2 ;;
     --cs-token)          CS_TOKEN="$2";         shift 2 ;;
-    --github-fork)       GITHUB_REPO_FORK="$2"; shift 2 ;;
     --node-type)         NODE_TYPE="$2";        shift 2 ;;
-    --skip-github)       SKIP_GHA=true;         shift ;;
     --teardown)          TEARDOWN=true;         shift ;;
     -h|--help)
       echo "Usage: $0 [options]"
@@ -60,7 +56,6 @@ while [[ $# -gt 0 ]]; do
       echo "  --api-key <key>        Vision One API key"
       echo "  --region <region>      Vision One region (default: us-east-1)"
       echo "  --cs-token <token>     Container Security bootstrap token (optional)"
-      echo "  --github-fork <url>    GitHub fork URL for Code Security setup (optional)"
       echo "  --node-type <type>     EKS node type (default: t3.xlarge)"
       echo "  --skip-github          Skip GitHub Actions workflow setup"
       echo "  --teardown             Tear down the stack instead of deploying"
@@ -154,15 +149,6 @@ if [ -z "$CS_TOKEN" ]; then
   read -rsp "  Bootstrap token (or Enter to skip): " CS_TOKEN; echo
 fi
 
-if ! $SKIP_GHA && [ -z "$GITHUB_REPO_FORK" ]; then
-  echo ""
-  info "GitHub fork URL for Code Security setup (optional)."
-  info "Example: https://github.com/yourname/demo-v1-app-sec-file-sec"
-  info "Leave blank to skip GitHub Actions setup."
-  read -rp "  Fork URL (or Enter to skip): " GITHUB_REPO_FORK
-  [ -z "$GITHUB_REPO_FORK" ] && SKIP_GHA=true
-fi
-
 STACK_NAME="trendai-aisec-${PARTICIPANT_NAME}"
 CLUSTER_NAME="trendai-aisec-${PARTICIPANT_NAME}"
 
@@ -172,7 +158,6 @@ echo -e "  ${BOLD}Cluster name:${NC} $CLUSTER_NAME"
 echo -e "  ${BOLD}V1 region   :${NC} $V1_REGION"
 echo -e "  ${BOLD}Node type   :${NC} $NODE_TYPE"
 echo -e "  ${BOLD}CS token    :${NC} ${CS_TOKEN:+(provided)}${CS_TOKEN:-not provided}"
-echo -e "  ${BOLD}GitHub fork :${NC} ${GITHUB_REPO_FORK:-(skipped)}"
 echo ""
 read -rp "  Proceed? [Y/n]: " CONFIRM
 [[ "${CONFIRM:-Y}" =~ ^[Nn] ]] && { info "Aborted."; exit 0; }
@@ -371,83 +356,33 @@ else
   warn "    https://github.com/trendmicro/visionone-container-security-helm/archive/main.tar.gz"
 fi
 
-# ── GitHub Actions ────────────────────────────────────────────────────────────
-if ! $SKIP_GHA && [ -n "$GITHUB_REPO_FORK" ]; then
-  hdr "Step 8 — GitHub Actions: Code Security workflow"
+# ── GitHub Actions — Code Security ───────────────────────────────────────────
+hdr "Step 8 — Code Security (GitHub Actions)"
 
-  CLONE_DIR=$(mktemp -d /tmp/demo-repo-XXXX)
-  info "Cloning fork: $GITHUB_REPO_FORK → $CLONE_DIR"
+# The workflow is already committed in this repo at .github/workflows/v1-code-security.yml.
+# It runs automatically on every push to main and every PR, scanning CFN templates,
+# K8s manifests, shell scripts, and lab tooling for secrets, CVEs, and malware.
+# The only manual step is adding the TMAS_API_KEY secret once.
 
-  if git clone --depth 1 "$GITHUB_REPO_FORK" "$CLONE_DIR" 2>/dev/null; then
-    # Create the workflow directory and copy the file
-    mkdir -p "$CLONE_DIR/.github/workflows"
+GHA_SECRET_URL="https://github.com/andrefernandes86/trendai-enablement-lab/settings/secrets/actions"
 
-    if [ -f "$GHA_TEMPLATE" ]; then
-      cp "$GHA_TEMPLATE" "$CLONE_DIR/.github/workflows/v1-code-security.yml"
-      ok "Workflow file copied to .github/workflows/v1-code-security.yml"
-    else
-      warn "GitHub Actions template not found at $GHA_TEMPLATE — writing inline..."
-      cat > "$CLONE_DIR/.github/workflows/v1-code-security.yml" <<'GHAEOF'
-name: Vision One Code Security
-on:
-  push:
-    branches: [main]
-  pull_request:
-permissions:
-  contents: read
-  pull-requests: write
-jobs:
-  v1-code-scan:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: repo
-      - uses: trendmicro/tmas-scan-action@v2
-        with:
-          version: '2'
-          vulnerabilitiesScan: true
-          secretsScan: true
-          malwareScan: true
-          artifact: dir:./repo
-          additionalArgs: --region=us-east-1
-          tmasApiKey: ${{ secrets.TMAS_API_KEY }}
-          githubToken: ${{ secrets.GITHUB_TOKEN }}
-GHAEOF
-    fi
-
-    # Commit and push
-    cd "$CLONE_DIR"
-    if git diff --quiet HEAD 2>/dev/null && git status --porcelain | grep -q "workflows"; then
-      git config user.email "lab-installer@trendai.lab"
-      git config user.name "TrendAI Lab Installer"
-      git add .github/workflows/v1-code-security.yml
-      git commit -m "ci: add Vision One Code Security GitHub Actions workflow"
-      git push origin HEAD
-      ok "Workflow pushed to fork."
-      echo ""
-      warn "ACTION REQUIRED — add the TMAS_API_KEY secret to the repo:"
-      warn "  1. Open: $GITHUB_REPO_FORK/settings/secrets/actions"
-      warn "  2. Click 'New repository secret'"
-      warn "  3. Name: TMAS_API_KEY"
-      warn "  4. Value: (your Vision One API key — same as V1ApiKey above)"
-    else
-      ok "Workflow file already present or no changes needed."
-    fi
-
-    cd "$SCRIPT_DIR"
-    rm -rf "$CLONE_DIR"
-  else
-    warn "Could not clone $GITHUB_REPO_FORK — skipping GitHub Actions setup."
-    warn "Add the workflow manually: copy github-actions/v1-code-security.yml"
-    warn "to .github/workflows/ in your fork and push."
-  fi
+if gh secret list --repo andrefernandes86/trendai-enablement-lab 2>/dev/null | grep -q "TMAS_API_KEY"; then
+  ok "TMAS_API_KEY secret already configured on trendai-enablement-lab."
+elif command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+  info "Setting TMAS_API_KEY secret via GitHub CLI..."
+  echo -n "$V1_API_KEY" | gh secret set TMAS_API_KEY \
+    --repo andrefernandes86/trendai-enablement-lab
+  ok "TMAS_API_KEY secret set. Code Security scan will run on next push."
 else
-  info "GitHub Actions setup skipped."
+  warn "ACTION REQUIRED — add TMAS_API_KEY to the repo once:"
+  warn "  1. Open: $GHA_SECRET_URL"
+  warn "  2. New repository secret → Name: TMAS_API_KEY"
+  warn "  3. Value: your Vision One API key (same as V1ApiKey used above)"
+  warn "  The workflow .github/workflows/v1-code-security.yml is already committed."
 fi
 
 # ── Wait for app to respond ───────────────────────────────────────────────────
-hdr "Step ${SKIP_GHA:+8}${SKIP_GHA:-9} — Verify app is reachable"
+hdr "Step 9 — Verify app is reachable"
 
 if [ -n "$APP_URL" ]; then
   info "Waiting for app to respond at $APP_URL..."
@@ -520,9 +455,5 @@ if [ -z "$CS_TOKEN" ]; then
   echo ""
 fi
 
-if $SKIP_GHA; then
-  echo -e "  ${YELLOW}${BOLD}Next step — Code Security:${NC}"
-  echo "  Copy github-actions/v1-code-security.yml to .github/workflows/ in your demo repo fork"
-  echo "  Add TMAS_API_KEY as a GitHub Actions secret"
-  echo ""
-fi
+echo -e "  ${BOLD}Code Security       :${NC} Workflow in .github/workflows/v1-code-security.yml"
+echo -e "                         Runs on every push/PR to trendai-enablement-lab"
