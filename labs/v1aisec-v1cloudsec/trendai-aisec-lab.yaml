@@ -463,19 +463,16 @@ Resources:
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
           # ── Write CFN parameters to lab.conf ──────────
-          # Only this block uses Fn::Sub. All script logic is in bootstrap.sh.
+          # Only this section uses Fn::Sub. All script logic is in bootstrap.sh.
           mkdir -p /opt/lab
-          cat > /opt/lab/lab.conf <<'LABCONF_EOF'
-          CLUSTER_NAME=trendai-aisec-${ParticipantName}
-          AWS_REGION=${AWS::Region}
-          V1_API_KEY=${V1ApiKey}
-          V1_REGION=${V1Region}
-          V1_GUARD_URL_BASE=${V1GuardUrlBase}
-          CS_TOKEN=${ContainerSecurityToken}
-          LABCONF_EOF
-
-          # Fix indentation (heredoc above has leading spaces)
-          sed -i 's/^[[:space:]]*//' /opt/lab/lab.conf
+          printf '%s\n' \
+            "CLUSTER_NAME=trendai-aisec-${ParticipantName}" \
+            "AWS_REGION=${AWS::Region}" \
+            "V1_API_KEY=${V1ApiKey}" \
+            "V1_REGION=${V1Region}" \
+            "V1_GUARD_URL_BASE=${V1GuardUrlBase}" \
+            "CS_TOKEN=${ContainerSecurityToken}" \
+            > /opt/lab/lab.conf
 
           # ── Clone repo and run bootstrap.sh ───────────
           git clone --depth=1 \
