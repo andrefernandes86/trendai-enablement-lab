@@ -337,7 +337,7 @@ Resources:
   BootstrapSg:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Bootstrap EC2 — app + Ollama inbound, all outbound
+      GroupDescription: Bootstrap EC2 - app and Ollama inbound, all outbound
       VpcId: !Ref LabVpc
       SecurityGroupIngress:
         - IpProtocol: tcp
