@@ -240,6 +240,7 @@ kubectl create secret generic app-secrets \
 # ── Apply remaining manifests ──────────────────────────────────────────────────
 kubectl apply -f /opt/lab/k8s/ollama.yaml
 kubectl apply -f /opt/lab/k8s/app.yaml
+kubectl apply -f /opt/lab/repo/labs/v1aisec-v1cloudsec/k8s/ai-scanner.yaml
 echo "[+] K8s manifests applied."
 
 # ── Container Security (optional) ─────────────────────────────────────────────
