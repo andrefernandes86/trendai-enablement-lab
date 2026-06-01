@@ -357,6 +357,22 @@ Resources:
         - Key: Name
           Value: !Sub trendai-aisec-${ParticipantName}-bootstrap-sg
 
+  # Allow bootstrap EC2 to reach the EKS private API endpoint on 443
+  # (kubectl port-forward requires API access; private endpoint resolves
+  #  to VPC-internal IPs which are gated by the cluster security group)
+  EksApiAccessFromBootstrap:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn:
+      - BootstrapSg
+      - EksCluster
+    Properties:
+      GroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref BootstrapSg
+      Description: Allow bootstrap EC2 to reach EKS API for kubectl
+
   # ────────────────────────────────────────────
   # EKS Cluster
   # ────────────────────────────────────────────
@@ -499,7 +515,7 @@ Resources:
           echo "=== TrendAI UserData — writing config and starting bootstrap ==="
 
           # ── Install tools ──────────────────────────────
-          dnf install -y git curl jq unzip python3-pip
+          dnf install -y git jq unzip python3-pip
 
           # kubectl
           KUBE_VER=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
