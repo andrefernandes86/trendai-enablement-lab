@@ -284,7 +284,8 @@ hdr "Step 6 — Waiting for Kubernetes nodes and pods"
 
 info "Waiting for EKS nodes to be Ready..."
 for i in $(seq 1 30); do
-  READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready' || echo 0)
+  READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready' 2>/dev/null || true)
+  READY_NODES=${READY_NODES:-0}
   if [ "$READY_NODES" -ge 1 ]; then
     ok "$READY_NODES node(s) ready."
     break
@@ -298,10 +299,12 @@ kubectl get nodes
 info "Waiting for trendai-lab pods to be Running..."
 for i in $(seq 1 40); do
   RUNNING=$(kubectl get pods -n trendai-lab --no-headers 2>/dev/null \
-    | grep -c 'Running' || echo 0)
+    | grep -c 'Running' 2>/dev/null || true)
+  RUNNING=${RUNNING:-0}
   TOTAL=$(kubectl get pods -n trendai-lab --no-headers 2>/dev/null \
-    | wc -l | tr -d ' ' || echo 0)
-  printf "\r  %d/%d pods running (attempt %d/40, waiting 15s)..." "$RUNNING" "$TOTAL" "$i"
+    | wc -l | tr -d ' ')
+  TOTAL=${TOTAL:-0}
+  printf "\r  %s/%s pods running (attempt %d/40, waiting 15s)..." "$RUNNING" "$TOTAL" "$i"
   [ "$RUNNING" -ge 2 ] && { echo ""; ok "App pods are running."; break; }
   sleep 15
 done
