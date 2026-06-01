@@ -1,0 +1,111 @@
+---
+# Persistent volume for model storage (survives pod restarts)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: trendai-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: gp2
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: trendai-lab
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - containerPort: 11434
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "12Gi"
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: trendai-lab
+spec:
+  selector:
+    app: ollama
+  ports:
+    - name: api
+      port: 11434
+      targetPort: 11434
+  type: ClusterIP
+
+---
+# Job: pulls llama3.2:3b after Ollama is ready.
+# Runs once at deploy time. Safe to re-apply (completed Job is ignored).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-model-pull
+  namespace: trendai-lab
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: pull
+          image: curlimages/curl:8
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[*] Waiting for Ollama to be ready..."
+              until curl -sf http://ollama:11434/api/tags > /dev/null; do
+                echo "  not ready yet — retrying in 5s..."
+                sleep 5
+              done
+              echo "[+] Ollama ready. Pulling llama3.2:3b (this may take several minutes)..."
+              curl -sf -X POST http://ollama:11434/api/pull \
+                -H 'Content-Type: application/json' \
+                -d '{"name":"llama3.2:3b"}' \
+                --no-buffer | grep -v '^$' || true
+              echo "[+] Model pull complete."

@@ -1,0 +1,99 @@
+---
+# Non-sensitive configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: trendai-lab
+data:
+  OLLAMA_BASE_URL: "http://ollama:11434"
+  OLLAMA_MODEL: "llama3.2:3b"
+  V1_GUARD_ENABLED: "true"
+  V1_GUARD_DETAILED: "true"
+  ENFORCE_SIDE: "both"
+  V1FS_ENABLED: "true"
+  EXT_PORT: "8000"
+
+---
+# Sensitive values — populated by the bootstrap EC2 UserData via kubectl create secret.
+# The placeholder values below are overwritten during deployment.
+# Do NOT commit real API keys here.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: trendai-lab
+type: Opaque
+stringData:
+  V1_GUARD_API_KEY: "REPLACE_AT_DEPLOY_TIME"
+  V1FS_API_KEY: "REPLACE_AT_DEPLOY_TIME"
+  V1FS_REGION: "REPLACE_AT_DEPLOY_TIME"
+  V1_GUARD_URL_BASE: "https://api.xdr.trendmicro.com/beta/aiSecurity/guard"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trendai-app
+  namespace: trendai-lab
+  labels:
+    app: trendai-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trendai-app
+  template:
+    metadata:
+      labels:
+        app: trendai-app
+    spec:
+      containers:
+        - name: app
+          image: andrefernandes86/tools-ai-sec-demo:latest
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
+---
+# LoadBalancer Service — AWS provisions an NLB automatically.
+# The external hostname is used as the app URL in stack Outputs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: trendai-app
+  namespace: trendai-lab
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: trendai-app
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

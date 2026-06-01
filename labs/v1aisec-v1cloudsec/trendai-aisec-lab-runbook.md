@@ -2,7 +2,9 @@
 
 Deploy and operate Trend Vision One protection across an AI application stack —
 covering AI Guard, AI Scanner, File Security, Container Security, and Code Security.
-One CloudFormation stack per participant runs a live Ollama LLM + demo web app.
+One CloudFormation stack per participant deploys an EKS cluster running a live
+Ollama LLM + demo web app, with Container Security protecting the cluster and
+Code Security scanning the repo on every push via GitHub Actions.
 
 Five Vision One controls are active simultaneously. The lab is structured so
 participants see the full picture: what an attacker does, what each control detects,
@@ -14,22 +16,27 @@ and how the controls complement each other in a real AI application deployment.
 
 | Component | What it is | Where it runs |
 |---|---|---|
-| `lab-app` container | Demo FastAPI app + Vue SPA | Docker on EC2 |
-| `lab-ollama` container | Ollama LLM server (tinyllama / llama3.2) | Docker on EC2 |
-| `v1cs-sensor` container | Container Security runtime sensor | Docker on EC2 |
+| `ollama` pod | Ollama LLM server (llama3.2:3b) | EKS — `trendai-lab` namespace |
+| `trendai-app` pod | Demo FastAPI app + SPA | EKS — `trendai-lab` namespace |
+| Container Security | Admission controller + runtime sensor DaemonSet + oversight | EKS — `trendmicro-system` namespace |
+| Bootstrap EC2 | kubectl + helm + ai-scan + cs-attack | EC2 t3.small (SSM only) |
 | V1 AI Guard | Prompt injection / response filter | Vision One API (cloud) |
 | V1 File Security | File upload malware scanning | Vision One API (cloud) |
-| V1 AI Scanner | `ai-scan` script on EC2 | Runs from EC2 → Ollama API |
-| V1 Code Security | GitHub repo scanner | Vision One → GitHub integration |
+| V1 AI Scanner | `ai-scan` script on bootstrap EC2 | Runs kubectl port-forward → Ollama |
+| V1 Code Security | TMAS GitHub Actions scan | GitHub Actions on push/PR |
 
-Access is through **SSM Session Manager only**. No SSH ports are open.
+Access to the bootstrap EC2 is through **SSM Session Manager only**. No SSH ports open.
+The app is exposed via an AWS NLB LoadBalancer Service on port 8000.
 
 ---
 
 ## Prerequisites (facilitator — do this before the session)
 
-1. **AWS quotas** — 1 VPC + 1 Elastic IP per participant. Request increases in
-   Service Quotas if you are running more than 5 stacks.
+1. **AWS quotas** — EKS requires 2+ subnets across 2 AZs, 1 NAT gateway, and
+   EC2 capacity for the node group. Check Service Quotas for:
+   - *VPCs per Region*: at least `1 × participants` (default 5)
+   - *EC2-VPC Elastic IPs*: at least `1 × participants` (for NAT gateway)
+   - *Running On-Demand Standard instances*: enough for `t3.xlarge × participants`
 
 2. **Vision One tenant** — confirm all five modules are licensed and enabled:
    - AI Security (AI Guard + AI Scanner)
@@ -38,33 +45,36 @@ Access is through **SSM Session Manager only**. No SSH ports are open.
    - Code Security
 
 3. **API key** — create a dedicated lab key in Vision One > Administration > API Keys.
-   Assign scopes: **AI Security (read/write)**, **File Security (read/write)**,
-   **Container Security (read/write)**. Note: Code Security uses GitHub App auth,
-   not this API key.
+   Assign scopes: **AI Security (read/write)**, **File Security (read/write)**.
+   Note: Container Security uses bootstrap tokens; Code Security uses the TMAS API key.
 
-4. **GitHub App** — in Vision One > Code Security > Repositories, install the
-   Vision One Code Security GitHub App on the demo repo fork (or the original repo
-   `andrefernandes86/demo-v1-app-sec-file-sec`). The initial scan should complete
-   before the session so findings are ready to show.
+4. **Container Security bootstrap token** — Vision One > Container Security >
+   Clusters > Add Cluster > Copy Token. Pass this as `ContainerSecurityToken` in the
+   CFN parameters — the bootstrap EC2 will run `helm install` automatically.
+   Tokens expire after 24 hours, so generate them close to session time.
+   If deploying stacks the day before, leave the parameter blank and run the Helm
+   install manually in Module 3.
 
-5. **Container Security enrollment token** — Vision One > Container Security >
-   Clusters > Add Cluster > Standalone Docker. Copy the enrollment token. You will
-   run `cs-enroll <token>` on each participant's instance in Module 3.
+5. **GitHub Actions setup** (do this on the demo repo fork before the session):
+   - Fork `andrefernandes86/demo-v1-app-sec-file-sec` to your GitHub account
+   - Add the workflow file: copy `github-actions/v1-code-security.yml` from this
+     lab folder to `.github/workflows/v1-code-security.yml` in the fork
+   - Add the secret: GitHub repo > Settings > Secrets > Actions > `TMAS_API_KEY` =
+     your Vision One API key (same key as `V1ApiKey` in the CFN parameters)
+   - Trigger a scan: push a commit — the workflow should run and show findings
 
-6. **Ollama model choice** — `tinyllama` (637 MB, pulls in ~2 min) is the default
-   and starts fastest. `llama3.2:3b` (2 GB, ~5 min) gives better prompt injection
-   demo responses. Decide before the session based on available time.
-
-7. **Test the stack** — deploy one stack for yourself the day before. Validate:
-   - App UI loads at `http://<PublicIp>:8000`
+6. **Test the stack** — deploy one stack for yourself the day before. Validate:
+   - `kubectl get pods -n trendai-lab` shows all pods Running
+   - App UI loads at the NLB hostname on port 8000
    - AI Guard blocks at least one prompt injection from the UI
    - EICAR upload is detected
    - `ai-scan` completes without errors
-   - `cs-attack` runs and Container Security shows events
+   - `cs-attack` runs and Container Security shows Runtime Events in Vision One
+   - GitHub Actions scan shows results on the PR/push
 
 ---
 
-## Per-participant deploy (~5 minutes)
+## Per-participant deploy (~20 minutes)
 
 ```bash
 aws cloudformation deploy \
@@ -72,39 +82,47 @@ aws cloudformation deploy \
   --stack-name trendai-aisec-<name> \
   --parameter-overrides \
     ParticipantName=<name> \
-    AdminCidr=<participant-public-ip>/32 \
     V1ApiKey=<api-key> \
     V1Region=us-east-1 \
-    OllamaModel=tinyllama \
+    ContainerSecurityToken=<bootstrap-token> \
   --capabilities CAPABILITY_IAM
 ```
 
-Wait for `CREATE_COMPLETE`, then read the **Outputs** tab for the app URL, instance
-ID, and the pre-built SSM connect commands.
+**Timing:** EKS cluster provisioning takes ~12-15 minutes. The bootstrap EC2 then
+waits for nodes to be ready and applies the K8s manifests. Expect ~20 minutes total
+from `deploy` to app being reachable. Deploy stacks in parallel for all participants.
 
-**Note on timing:** the UserData pulls Docker images and the Ollama model at boot.
-Allow ~5 minutes after `CREATE_COMPLETE` before the app UI is ready. Check readiness:
+**Check readiness** via the bootstrap EC2:
 
 ```bash
-aws ssm start-session --target <instance-id> \
-  --document-name AWS-StartInteractiveCommand \
-  --parameters command="curl -sf http://localhost:8000/ && echo ready"
+# Connect to bootstrap EC2
+aws ssm start-session --target <BootstrapInstanceId from Outputs>
+
+# Check pods
+kubectl get pods -n trendai-lab
+
+# Get the app URL
+kubectl get svc trendai-app -n trendai-lab
 ```
+
+The app URL is the `EXTERNAL-IP` (NLB hostname) on port 8000. Allow ~2 minutes after
+the LoadBalancer hostname appears for DNS to propagate.
 
 ---
 
 ## Module 0 — Connect and orient (everyone, 5 min)
 
-- Open the **App URL** from stack Outputs in a browser. You should see the TrendAI
-  demo app with a chat interface, a file upload panel, and a settings panel.
-- Open an **SSM session** to the instance via the `SsmConnectCommand` from Outputs.
-- Run `docker ps` — confirm three containers are running:
-  `lab-ollama`, `lab-app`, and (after Module 3) `v1cs-sensor`.
-- In the app Settings panel, verify that AI Guard and File Security are both enabled
-  (green indicators). If they show red, paste the V1 API key manually.
+- Open an **SSM session** to the bootstrap EC2 via the `SsmConnectCommand` from Outputs.
+- Run `kubectl get pods -n trendai-lab` — confirm `ollama` and `trendai-app` pods are Running.
+- Run `kubectl get pods -n trendmicro-system` — confirm Container Security pods are Running
+  (admission controller, runtime sensor DaemonSet, oversight controller).
+- Get the app URL: `kubectl get svc trendai-app -n trendai-lab`
+  Open `http://<EXTERNAL-IP>:8000` in a browser.
+- In the app Settings panel, verify AI Guard and File Security are both enabled (green).
 
-**Teaching point:** this is a realistic AI application deployment — an LLM backend,
-a web front-end, file upload handling, and real-time API security controls. The
+**Teaching point:** this is a realistic AI application deployment on Kubernetes —
+an LLM backend, a web front-end, file upload handling, and real-time API security
+controls. Container Security protects all workloads at the cluster level. The
 attacker has the same external access the user has: just the app URL.
 
 ---
@@ -154,65 +172,118 @@ processes it. This matters for AI apps that accept documents as context.
 
 ## Module 3 — Container Security: runtime protection (everyone, 25 min)
 
-**Part A — Enroll the sensor:**
+Container Security is deployed as a Helm chart on the EKS cluster with three components:
+- **Admission controller** — evaluates every pod deployment against policy
+- **Runtime sensor** (DaemonSet on each node) — Falco-based, monitors syscalls
+- **Oversight controller** — continuously re-evaluates running workloads
+
+**Part A — Confirm enrollment (or install manually if token was not provided at deploy time):**
 
 ```bash
-# Get a token from Vision One > Container Security > Clusters > Add > Standalone Docker
-cs-enroll <enrollment-token>
+# From the bootstrap EC2 SSM session
+kubectl get pods -n trendmicro-system
+
+# If not yet installed, install now:
+kubectl create namespace trendmicro-system
+kubectl label namespace trendmicro-system \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/warn=privileged
+
+helm install \
+  --values /opt/lab/k8s/container-security-overrides.yaml \
+  --namespace trendmicro-system \
+  --create-namespace \
+  trendmicro \
+  https://github.com/trendmicro/visionone-container-security-helm/archive/main.tar.gz
 ```
 
-- Confirm `v1cs-sensor` appears in `docker ps`.
-- In Vision One > Container Security > Clusters, confirm the lab instance appears as connected.
+In Vision One > Container Security > Clusters, confirm the cluster appears as **Connected**.
 
-**Part B — Run the container attack simulation:**
+**Part B — Show the admission controller (policy enforcement at deploy time):**
+
+```bash
+# Try to deploy a privileged pod — admission controller should block it
+kubectl run priv-test --image=alpine --privileged -n trendai-lab -- sleep 3600
+```
+
+If a deny policy is configured in Vision One, this deployment is blocked at the
+API server before the pod ever runs. Show the rejection message.
+
+**Part C — Run the runtime attack simulation:**
 
 ```bash
 cs-attack
 ```
 
-This runs 6 attack phases against the running containers:
-1. Container escape attempt (privileged filesystem access)
-2. Sensitive file read (`/etc/shadow`, `/proc/1/environ`)
-3. Malicious script drop and execution in `/tmp`
-4. Internal network scan / IMDS probe
-5. AWS IMDS credential theft attempt (T1552.005)
-6. Reverse shell simulation
+This runs 6 attack phases against the running `trendai-app` pod via `kubectl exec`:
+1. Sensitive file read (`/etc/shadow`, `/proc/1/environ`) — T1552
+2. Malicious script drop and execution in `/tmp` — T1059.004
+3. IMDS credential theft (`169.254.169.254`) — T1552.005
+4. Internal network scan — T1046
+5. Reverse shell simulation — T1059
+6. Container namespace escape attempt — T1611
 
-After the script completes, go to Vision One > Container Security > Runtime Events.
-Walk through each detection with participants:
-- Which container was targeted?
-- What process triggered the event?
-- What ATT&CK technique does it map to?
+After the script completes, go to **Vision One > Container Security > Runtime Events**.
+Walk through each detection:
+- Which pod/namespace was targeted?
+- Which process triggered the alert?
+- What ATT&CK technique is it mapped to?
+- Is the event severity High / Critical?
 
-**Part C — Container image scanning (bonus):**
-- In Vision One > Container Security > Image Scanning, add the lab container image:
+**Part D — Container image scanning (bonus):**
+- In Vision One > Container Security > Image Scanning, add:
   `andrefernandes86/tools-ai-sec-demo:latest`
-- Review the vulnerability findings — this is the shift-left complement to runtime detection.
+- Review vulnerability findings — this is the shift-left complement to runtime protection.
 
-**Teaching point:** Container Security sees what happens *inside* the container at
-runtime, not just what the network sees. Attacks 3, 4, and 6 above leave no network
-trace — only the container runtime sensor catches them.
+**Teaching point:** The admission controller stops bad workloads from deploying.
+The runtime sensor catches attacks *after* a workload is running. Together they cover
+the full pod lifecycle — attacks 2, 3, and 5 above leave no network trace and would
+be invisible to NDR/DDI alone.
 
 ---
 
-## Module 4 — Code Security: source scanning (everyone, 15 min)
+## Module 4 — Code Security: GitHub Actions scan (everyone, 15 min)
 
-This module uses the GitHub integration configured in pre-lab setup.
+Code Security runs automatically via the `trendmicro/tmas-scan-action@v2` GitHub
+Actions workflow on every push to `main` and every pull request.
 
-- Open Vision One > Code Security > Repositories — confirm the demo repo is connected.
-- Open **Findings** and walk through the categories:
-  - **Secrets**: any API keys or tokens found in the repo?
-  - **Vulnerable dependencies**: Python packages in `requirements.txt` with known CVEs?
-  - **IaC misconfigurations**: anything in `docker-compose.yml` flagged (exposed ports, missing security options)?
-  - **SAST**: anything in `app.py` flagged as a potential injection sink or unsafe operation?
+**Part A — Show a completed scan:**
+- Open the demo repo fork on GitHub > **Actions** tab.
+- Click the most recent **Vision One Code Security** workflow run.
+- Walk through the **TMAS Scan Report** section in the logs:
+  - **Secrets**: any hardcoded API keys or tokens in the repo?
+  - **Vulnerabilities**: Python packages in `requirements.txt` with known CVEs?
+  - **Malware**: any committed files flagged?
+- If there is an open PR, show the scan summary comment posted automatically.
 
-**Part B — Trigger a new scan:**
-- Make a trivial change to the repo (add a comment to `requirements.txt`), commit, and push.
-- In Vision One > Code Security, watch the scan trigger automatically.
+**Part B — Trigger a live scan:**
 
-**Teaching point:** Code Security catches vulnerabilities before they ever run.
-Container Security catches attacks at runtime. Together they cover the full lifecycle:
-build-time (Code Security) → deploy-time (container image scan) → runtime (Container Security).
+```bash
+# On your local machine — clone the fork and push a change
+git clone https://github.com/<your-fork>/demo-v1-app-sec-file-sec /tmp/demo-repo
+cd /tmp/demo-repo
+echo "# lab test $(date)" >> requirements.txt
+git add requirements.txt
+git commit -m "lab: trigger Code Security rescan"
+git push
+```
+
+Watch the GitHub Actions workflow trigger and complete in ~1 minute.
+
+**Part C — Show the workflow file:**
+
+```bash
+cat .github/workflows/v1-code-security.yml
+```
+
+Explain the three scan types enabled: `vulnerabilitiesScan`, `secretsScan`, `malwareScan`.
+Point out that `TMAS_API_KEY` is stored as a GitHub secret — the same Vision One API
+key used everywhere else in the lab.
+
+**Teaching point:** Code Security integrates directly into the developer workflow.
+Every commit is scanned. Findings appear as PR comments so developers see them before
+merge — no separate portal to check. The same API key that protects the running app
+(AI Guard, File Security) also powers the pre-commit scanning.
 
 ---
 
@@ -289,13 +360,29 @@ at runtime.
 
 ## Cost and lifecycle
 
-- **Instance type:** `c5.2xlarge` is ~$0.34/hr (us-east-1). One stack for 4 hours ≈ $1.40.
-- **Stop between days:** stop the instance (do not terminate) to pause compute cost.
+- **EKS cluster:** ~$0.10/hr (us-east-1) for the control plane.
+- **Node group:** `t3.xlarge` ~$0.17/hr. One stack for 4 hours ≈ $1.08 for the node.
+- **NAT gateway:** ~$0.045/hr + data transfer. Leave it running — stopping the node
+  group does not stop the NAT gateway billing.
+- **Stop between days:** scale the node group to 0 to pause EC2 cost (EKS control
+  plane and NAT gateway still bill). To scale down:
+
+  ```bash
+  aws eks update-nodegroup-config \
+    --cluster-name trendai-aisec-<name> \
+    --nodegroup-name trendai-aisec-<name>-nodes \
+    --scaling-config minSize=0,maxSize=2,desiredSize=0
+  ```
+
 - **Teardown:**
 
   ```bash
   aws cloudformation delete-stack --stack-name trendai-aisec-<name>
   ```
+
+  Note: delete removes the EKS cluster and node group. The NLB LoadBalancer created
+  by the Kubernetes Service is managed outside CloudFormation — confirm it is deleted
+  in the EC2 > Load Balancers console after stack deletion.
 
 ---
 
@@ -303,9 +390,13 @@ at runtime.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| App UI not loading after `CREATE_COMPLETE` | Ollama model still pulling | Wait ~5 min; check `/var/log/lab-init.log` via SSM |
-| AI Guard shows red in app UI | API key not set or wrong scope | Re-enter the key in app Settings; verify AI Security scope |
-| `ai-scan` reports Ollama not reachable | Ollama container not healthy | `docker ps` — restart with `docker-compose -f /opt/lab/docker-compose.yml up -d ollama` |
-| `cs-enroll` fails with image pull error | Container Security image name changed | Pull the latest image name from Vision One > Container Security > Add Cluster |
-| No Code Security findings | GitHub App not installed or scan pending | Check Vision One > Code Security > Repositories — re-trigger scan if needed |
-| Stack fails at VPC creation | VPC quota hit | Raise VPC quota in Service Quotas, then retry |
+| Stack takes >25 min | EKS cluster creation is slow | Normal — EKS control plane takes 12-15 min. Check CloudFormation Events tab |
+| Pods not running after `CREATE_COMPLETE` | Bootstrap EC2 still applying manifests | Check `/var/log/lab-bootstrap.log` via SSM: `cat /var/log/lab-bootstrap.log` |
+| App UI not loading | Ollama model still pulling / NLB DNS not propagated | `kubectl get job ollama-model-pull -n trendai-lab`; wait 2 min for DNS |
+| AI Guard shows red in app UI | API key missing or wrong scope | Re-enter in app Settings; verify AI Security scope on the key |
+| `ai-scan` errors "port-forward failed" | kubectl not configured or pod not running | Run from bootstrap EC2 SSM session where kubeconfig is pre-set |
+| `cs-attack` errors "no such container" | Pod name mismatch | Use `kubectl get pods -n trendai-lab` to confirm pod name, then re-run |
+| Container Security pods not starting | Pod Security Admission | `kubectl label namespace trendmicro-system pod-security.kubernetes.io/enforce=privileged --overwrite` |
+| Container Security Helm install fails | Bootstrap token expired (24h TTL) | Generate a new token in Vision One and re-run the `helm install` command |
+| GitHub Actions scan not triggering | Workflow file not committed or secret missing | Confirm `.github/workflows/v1-code-security.yml` exists and `TMAS_API_KEY` secret is set |
+| Stack fails at VPC creation | VPC or EIP quota hit | Raise quotas in Service Quotas, then retry |

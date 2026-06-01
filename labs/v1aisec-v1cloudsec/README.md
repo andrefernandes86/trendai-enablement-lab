@@ -163,25 +163,41 @@ on every push and pull request via a GitHub App integration.
 ## Architecture
 
 ```
-AWS (single VPC, public subnet)
-┌─────────────────────────────────────────────┐
-│                                             │
-│  EC2 (c5.2xlarge)                           │
-│  ┌───────────────────────────────────────┐  │
-│  │  Docker                               │  │
-│  │  ┌─────────────┐  ┌────────────────┐  │  │
-│  │  │  lab-ollama │  │   lab-app      │  │  │
-│  │  │  (Ollama)   │◄─│ (FastAPI SPA)  │  │  │
-│  │  │  :11434     │  │ :8000          │  │  │
-│  │  └─────────────┘  └────────────────┘  │  │
-│  │  ┌────────────────────────────────┐   │  │
-│  │  │  v1cs-sensor (Container Sec)  │   │  │
-│  │  └────────────────────────────────┘   │  │
-│  └───────────────────────────────────────┘  │
-│                                             │
-│  Access: SSM Session Manager (no inbound)   │
-└─────────────────────────────────────────────┘
-        │ API calls (outbound HTTPS)
+GitHub repo (demo-v1-app-sec-file-sec)
+        │ push / PR
+        ▼
+┌───────────────────────────────────────┐
+│  GitHub Actions                       │
+│  trendmicro/tmas-scan-action@v2       │  ← Code Security scan
+│  (secrets, CVEs, malware)             │
+└───────────────────────────────────────┘
+        │ findings
+        ▼
+AWS — single VPC, 2 AZs
+┌──────────────────────────────────────────────────────────────┐
+│  EKS Cluster (trendai-aisec-<name>)                          │
+│                                                              │
+│  namespace: trendmicro-system                                │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Container Security (Helm)                           │   │
+│  │  • Admission controller (policy at deploy time)      │   │
+│  │  • Runtime sensor DaemonSet (Falco-based)            │   │
+│  │  • Oversight controller (continuous compliance)      │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  namespace: trendai-lab                                      │
+│  ┌──────────────┐    ┌─────────────────────────────────┐    │
+│  │  ollama pod  │◄───│  trendai-app pod                 │    │
+│  │  :11434      │    │  (FastAPI + AI Guard + V1FS)     │    │
+│  └──────────────┘    │  :8000  ← NLB LoadBalancer       │    │
+│       ▲ PVC          └─────────────────────────────────┘    │
+│  (model storage)                                             │
+│                                                              │
+│  Bootstrap EC2 (t3.small, SSM only)                          │
+│  • kubectl + helm pre-configured                             │
+│  • ai-scan, cs-attack scripts                                │
+└──────────────────────────────────────────────────────────────┘
+        │ outbound HTTPS
         ▼
 ┌───────────────────────────────┐
 │      Trend Vision One         │
@@ -198,9 +214,14 @@ AWS (single VPC, public subnet)
 
 | File | Description |
 |---|---|
-| `trendai-aisec-lab.yaml` | CloudFormation template — deploy one stack per participant |
+| `trendai-aisec-lab.yaml` | CloudFormation template — EKS cluster + bootstrap EC2, one stack per participant |
 | `trendai-aisec-lab-runbook.md` | Facilitator runbook — setup, modules, facilitation guide |
 | `trendai-aisec-attack-playbook.md` | Attack playbook — step-by-step test cases for all 5 controls |
+| `k8s/namespace.yaml` | Kubernetes namespace manifest |
+| `k8s/ollama.yaml` | Ollama Deployment, Service, PVC, and model-pull Job |
+| `k8s/app.yaml` | Demo app Deployment, ConfigMap, Secret, and NLB LoadBalancer Service |
+| `k8s/container-security-overrides.yaml` | Helm values template for Vision One Container Security |
+| `github-actions/v1-code-security.yml` | GitHub Actions workflow template — add to your demo repo fork |
 
 ---
 
@@ -225,12 +246,13 @@ aws cloudformation deploy \
   --stack-name trendai-aisec-<name> \
   --parameter-overrides \
     ParticipantName=<name> \
-    AdminCidr=<your-ip>/32 \
     V1ApiKey=<your-v1-api-key> \
     V1Region=us-east-1 \
-    OllamaModel=llama3.2:3b \
+    ContainerSecurityToken=<bootstrap-token-from-v1-portal> \
   --capabilities CAPABILITY_IAM
 ```
+
+**Timing:** allow ~20 minutes from deploy to app ready (EKS takes ~15 min to provision).
 
 ### Parameters
 

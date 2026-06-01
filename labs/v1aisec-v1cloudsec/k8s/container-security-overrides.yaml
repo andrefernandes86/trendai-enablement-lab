@@ -1,0 +1,33 @@
+# Vision One Container Security — Helm overrides for the lab cluster.
+#
+# Apply with:
+#   helm install \
+#     --values container-security-overrides.yaml \
+#     --namespace trendmicro-system \
+#     --create-namespace \
+#     trendmicro \
+#     https://github.com/trendmicro/visionone-container-security-helm/archive/main.tar.gz
+#
+# Get the bootstrap token from:
+#   Vision One > Container Security > Clusters > Add Cluster > Copy Token
+# Tokens expire after 24 hours. For repeatable lab automation use the
+# clusterRegistrationKey method (see runbook).
+
+visionOne:
+  # Replace with the token from Vision One > Container Security > Clusters > Add Cluster
+  bootstrapToken: "REPLACE_WITH_BOOTSTRAP_TOKEN"
+
+runtimeSecurity:
+  # Runtime sensor — detects container escape, privilege escalation, reverse shells,
+  # IMDS credential theft, anomalous process execution, sensitive file access.
+  enabled: true
+
+admissionController:
+  # Admission controller — blocks non-compliant pods at deploy time based on policy.
+  # Set to false if you want detection-only for the lab; set to true to also
+  # demonstrate policy enforcement blocking a deployment.
+  enabled: true
+
+oversight:
+  # Continuous compliance — re-evaluates running workloads against policy.
+  enabled: true

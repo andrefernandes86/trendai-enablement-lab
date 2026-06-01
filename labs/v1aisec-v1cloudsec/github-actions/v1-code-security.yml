@@ -1,0 +1,61 @@
+# Vision One Code Security — GitHub Actions workflow
+#
+# Add this file to your fork of the demo repo at:
+#   .github/workflows/v1-code-security.yml
+#
+# Prerequisites:
+#   1. Add TMAS_API_KEY to your repo secrets:
+#      GitHub repo > Settings > Secrets and variables > Actions > New repository secret
+#      Name: TMAS_API_KEY
+#      Value: your Vision One API key (needs File Security / Code Security scope)
+#
+#   2. Set the correct region in additionalArgs below.
+#      Supported: us-east-1 | eu-central-1 | eu-west-2 | ap-southeast-1 |
+#                 ap-southeast-2 | ap-south-1 | ap-northeast-1
+#
+# What this does:
+#   - Runs on every push to main and every pull request
+#   - Scans the full repo for: dependency CVEs, hardcoded secrets, malware
+#   - Posts a summary comment on pull requests (requires pull-requests: write)
+#   - Full findings appear in the Actions run log under "TMAS Scan Report"
+
+name: Vision One Code Security
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  v1-code-scan:
+    name: Trend Vision One — Code Security Scan
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Scan with Vision One TMAS
+        uses: trendmicro/tmas-scan-action@v2
+        with:
+          version: '2'
+          # Dependency / SCA scan — detects CVEs in requirements.txt, package.json, etc.
+          vulnerabilitiesScan: true
+          # Secret detection — detects hardcoded API keys, tokens, passwords
+          secretsScan: true
+          # Malware scan — detects malicious files committed to the repo
+          malwareScan: true
+          # Target: the checked-out repo directory
+          artifact: dir:./repo
+          # Change region to match your Vision One tenant
+          additionalArgs: --region=us-east-1
+          tmasApiKey: ${{ secrets.TMAS_API_KEY }}
+          # Required for PR comment posting
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
