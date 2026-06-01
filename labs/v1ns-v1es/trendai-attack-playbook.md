@@ -6,23 +6,29 @@ the VPC2 protected estate, then moves laterally. Everything here is adversary
 payloads (EICAR), authenticated movement with the lab's own credentials, and
 Atomic Red Team with cleanup. Do not run any of this outside this lab.
 
-The goal: every phase produces something visible in **DDI** (network) and in
-**Server & Workload Protection / Vision One XDR** (endpoint), fused into one
-Workbench incident.
+The goal: every phase produces something visible across the three detection layers —
+**V1ES/V1SWP** (host prevention), **EDR** (host telemetry), and **NDR / DDI**
+(network) — fused into one Workbench incident.
 
 ---
 
 ## Phase 0 - Arm the defenses first (or you will see nothing)
 
-Detections only fire if the protections are on. Before attacking, in Vision One
-Server & Workload Protection, apply a policy to the three VPC2 targets with:
+Detections only fire if the protections are on. All three VPC2 machines run both
+the **V1ES/V1SWP agent** (prevention) and the **EDR module** (telemetry). The
+**NDR layer** (DDI + Network Sensor) covers the network. Before attacking, confirm
+all three layers are active.
+
+In Vision One Server & Workload Protection, apply a policy to the three VPC2 targets with:
 
 - **Anti-Malware**: real-time scan on (catches EICAR).
 - **Firewall**: on, with **Reconnaissance** detection enabled (Network or Port
   Scan, OS Fingerprint Probe). This is what turns nmap into an agent detection.
 - **Intrusion Prevention (IPS)**: on, in Detect or Prevent.
-- **Activity Monitoring**: on. This is the telemetry that feeds the XDR Workbench
-  and lets it correlate endpoint behavior with DDI network events.
+- **Activity Monitoring** (EDR): on. This is the EDR telemetry module that feeds
+  the XDR Workbench and lets it correlate host behavior (process chains, file
+  writes, network connections) with DDI network events. Without this, the Workbench
+  incident graph will be sparse.
 - **Log Inspection (LI)**: on. Apply the pre-built rule sets for Linux
   ("Linux - Authentication", "Linux - Sudo", "Linux - System Events") and
   Windows ("Microsoft Windows Events - Security", "Microsoft Windows Events -
@@ -435,10 +441,13 @@ Run keys) often become the "root cause" node in the Workbench incident graph.
 
 ## Phase 5 - Review and respond
 
-- **DDI**: confirm detections for scanning, brute force, and lateral movement.
-- **Vision One Workbench**: open the correlated incident. It should fuse the DDI
-  network events with the SWP endpoint events across the attacker path
-  (U1 -> WIN -> U2) and show the observed attack techniques on a timeline.
+- **NDR (DDI / Network Sensor)**: confirm detections for scanning, brute force, and lateral movement.
+- **V1ES/V1SWP**: confirm prevention and detection events on each host (Anti-Malware, IPS, LI, IM).
+- **EDR (Activity Monitoring)**: confirm the Workbench incident graph shows the host-level execution
+  chain — process trees, file drops, and network connections from each endpoint's perspective.
+- **Vision One Workbench**: open the correlated incident. It should fuse all three layers — DDI
+  network events, V1SWP host events, and EDR telemetry — across the attacker path
+  (U1 -> WIN -> U2) into a single incident with observed attack techniques on a timeline.
 - **Response (SE track)**: isolate the Windows host, then release it.
 - **Outcome (CSM track)**: write the 3-bullet "what happened, what we caught,
   what the customer should do" recap.
@@ -447,24 +456,24 @@ Run keys) often become the "root cause" node in the Workbench incident graph.
 
 ## Detection mapping (quick reference)
 
-| Phase | Technique | What you run | DDI sees | SWP / XDR sees |
+| Phase | Technique | What you run | NDR (DDI) sees | V1ES/V1SWP sees | EDR (Workbench telemetry) |
 |-------|-----------|--------------|----------|----------------|
-| 1a | T1046 / T1595 | nmap | Port / network scan | Firewall recon event |
-| 1b | T1110 | hydra over SSH | Brute force | Failed-then-success logons |
-| 1c | T1078 | sshpass login | Anomalous session | Valid-account logon |
-| 1d | T1105 | EICAR write | - | Anti-Malware hit |
-| 2 | T1016/18/46 | local recon, subnet scan | Internal scan | Discovery activity |
-| 3a | T1021.002 | nxc smb | SMB lateral | Remote logon + exec |
-| 3b | T1021.001 | nxc rdp | RDP lateral | RDP logon |
-| 3c | T1021.004 | ssh + EICAR | SSH lateral | Anti-Malware on U2 |
-| 3d | T1110.001/.003 | nxc smb/winrm, hydra rdp | Windows brute force | Failed-then-success 4625/4624 |
-| 3e | T1021.002/.006/.004 | impacket wmiexec/psexec, evil-winrm, PowerShell SSH | SMB/WMI/WinRM sessions; SSH from Windows | Service create 7045, WMI exec, SSH from unexpected source |
-| 4 | T1059/1087/1053/1136/1003 | Atomic Red Team | - | Behavior + high-sev XDR |
-| 4b | T1190 (CVE exploit) | vulhub + Metasploit | Network exploit / CVE | IPS rule named for the CVE (virtual patching) |
-| 4c-linux | T1098/T1543/T1070 | failed sudo/su, service stop, cron write | - | LI: auth.log patterns - sudo fail, privilege escalation, service change |
-| 4c-win | T1136/T1543.003/T1053.005 | net user, sc create, schtasks | - | LI: EventID 4720/4732/7045/4698 |
-| 4d-linux | T1548.001/T1037/T1565 | /etc/passwd, /etc/hosts, SUID, cron.d, ssh config | - | IM: critical file change alert with before/after hash |
-| 4d-win | T1547.001/T1565/T1562.004 | Registry Run key, hosts, System32 drop, FW rule | - | IM: registry + file change alerts, high-severity |
+| 1a | T1046 / T1595 | nmap | Port / network scan | Firewall recon event | Outbound scan connections from attacker |
+| 1b | T1110 | hydra over SSH | Brute force | Failed-then-success logons | Auth burst → success process chain on U1 |
+| 1c | T1078 | sshpass login | Anomalous session | Valid-account logon | SSH session telemetry on U1 |
+| 1d | T1105 | EICAR write | - | Anti-Malware hit | File write event on U1 |
+| 2 | T1016/18/46 | local recon, subnet scan | Internal scan | Discovery activity | Process + network telemetry: nmap, arp, ip |
+| 3a | T1021.002 | nxc smb | SMB lateral | Remote logon + exec | SMB session + remote process exec on WIN |
+| 3b | T1021.001 | nxc rdp | RDP lateral | RDP logon | RDP session telemetry on WIN |
+| 3c | T1021.004 | ssh + EICAR | SSH lateral | Anti-Malware on U2 | SSH session + file write on U2 |
+| 3d | T1110.001/.003 | nxc smb/winrm, hydra rdp | Windows brute force | Failed-then-success 4625/4624 | Auth burst process chain; success logon event |
+| 3e | T1021.002/.006/.004 | impacket wmiexec/psexec, evil-winrm, PowerShell SSH | SMB/WMI/WinRM sessions; SSH from Windows | Service create 7045, WMI exec, SSH from unexpected source | Full process trees: wmiexec→cmd, psexec svc→payload, hop chain U1→WIN→U2 in workbench |
+| 4 | T1059/1087/1053/1136/1003 | Atomic Red Team | - | Behavior + high-sev XDR | Process/file/registry telemetry for each atomic |
+| 4b | T1190 (CVE exploit) | vulhub + Metasploit | Network exploit / CVE | IPS rule named for the CVE (virtual patching) | Process spawn from vulnerable service (if exploit lands) |
+| 4c-linux | T1098/T1543/T1070 | failed sudo/su, service stop, cron write | - | LI: auth.log patterns - sudo fail, privilege escalation, service change | Process telemetry: sudo chain, systemctl, cron write |
+| 4c-win | T1136/T1543.003/T1053.005 | net user, sc create, schtasks | - | LI: EventID 4720/4732/7045/4698 | Process telemetry: net.exe, sc.exe, schtasks.exe chains |
+| 4d-linux | T1548.001/T1037/T1565 | /etc/passwd, /etc/hosts, SUID, cron.d, ssh config | - | IM: critical file change alert with before/after hash | File write telemetry: path, process, user |
+| 4d-win | T1547.001/T1565/T1562.004 | Registry Run key, hosts, System32 drop, FW rule | - | IM: registry + file change alerts, high-severity | Registry write + file drop telemetry in workbench graph |
 
 ---
 

@@ -3,6 +3,10 @@
 Deploy and operate Trend Vision One across endpoint, network, and cloud, then
 generate detections and investigate them. One CloudFormation stack per person.
 
+Three detection layers are active on every VPC2 machine: **V1ES/V1SWP** (host
+prevention), **EDR** (host telemetry → XDR Workbench), and **NDR** (DDI + Network
+Sensor). The lab is designed so all three contribute to the same Workbench incident.
+
 The lab runs two parallel tracks on the same environment:
 
 - **SE track**: deploy the sensors, generate an attack, investigate the correlation.
@@ -78,16 +82,24 @@ private IPs, the DDI management IP, and the ready-to-run test-runner command.
 
 ---
 
-## Module 1 - Endpoint XDR agents (everyone, 20 min)
+## Module 1 - Endpoint agents (V1ES/V1SWP + EDR) (everyone, 20 min)
 
 Install the Vision One endpoint / Server & Workload Protection agent on the three
-endpoint targets (VPC1 Ubuntu, VPC2 Windows, VPC2 Ubuntu-1).
+endpoint targets (VPC1 Ubuntu, VPC2 Windows, VPC2 Ubuntu-1). This single agent
+delivers both **V1ES/V1SWP** (prevention: anti-malware, IPS, log inspection,
+integrity monitoring) and **EDR** (telemetry: continuous process, file, network,
+and registry recording that feeds the XDR Workbench).
 
 - In Vision One, copy the deployment script / installer and the enrollment token.
 - Paste and run it inside each host's SSM session (Linux) or via Fleet Manager (Windows).
 - Watch each host appear in the Vision One endpoint inventory.
+- After enrollment, apply a policy with **Activity Monitoring** enabled — this
+  activates the EDR module on each host. Without it, the Workbench incident graph
+  will have network events from DDI but no host-side execution context.
 
 **Teaching point:** participants run the same enrollment flow a customer would, end to end.
+The single agent covers both the prevention layer (V1ES/V1SWP) and the investigation
+layer (EDR); the network layer (NDR) is DDI + Network Sensor from Module 2.
 
 ---
 
@@ -138,13 +150,18 @@ Wait a few minutes, then move to your track.
 ## Module 5A - SE track: investigate (25 min)
 
 - Open the **Vision One Workbench** and find the correlated incident.
-- Trace the story: endpoint AV hit (EICAR) + network scan seen by DDI, tied to one host.
-- Pivot through the **execution profile / observed attack techniques**.
+- Trace the story across all three layers: endpoint AV hit (EICAR, V1ES/V1SWP) +
+  host execution telemetry (EDR: process chain that wrote the file) + network scan
+  seen by DDI (NDR), all tied to one host.
+- Pivot through the **execution profile / observed attack techniques** — the Workbench
+  node graph should show EDR telemetry nodes (process trees) alongside the DDI network
+  detection nodes.
 - Take one **response action**: isolate the Windows host, then release it.
 - Bonus: write the two-sentence "what happened and what we did" summary an SE would
   hand a customer.
 
-**Success when:** you can show a single incident that fuses endpoint + network evidence
+**Success when:** you can show a single incident that fuses all three layers —
+V1ES/V1SWP prevention events, EDR host telemetry, and DDI network detections —
 and you have isolated and released a host.
 
 ---

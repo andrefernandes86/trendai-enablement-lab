@@ -6,13 +6,13 @@ A self-contained AWS lab for demonstrating Trend Vision One detection and respon
 
 ## Detection Layers
 
-This lab exercises **two complementary Vision One detection layers** that participants should understand before starting.
+This lab exercises **three complementary Vision One detection layers** that participants should understand before starting. Every VPC2 machine runs both the V1ES/V1SWP agent and the EDR module; DDI + Network Sensor covers the network layer.
 
 ### 1. V1ES / V1SWP — Endpoint Security (Server & Workload Protection)
 
 **V1ES (Vision One Endpoint Security)** — also referred to as **V1SWP (Server & Workload Protection)** — is a lightweight security agent installed directly on each workload: Windows Server, Ubuntu-1, and Ubuntu-2.
 
-It is the primary **host-level** detection engine. Unlike network sensors that inspect traffic passing between machines, V1SWP runs *inside* the OS and has full visibility into what the operating system is doing:
+It is the primary **host-level** prevention and detection engine. Unlike network sensors that inspect traffic passing between machines, V1SWP runs *inside* the OS and has full visibility into what the operating system is doing:
 
 | Capability | What it detects in this lab |
 |---|---|
@@ -22,8 +22,6 @@ It is the primary **host-level** detection engine. Unlike network sensors that i
 | **Log Inspection** | Windows Event ID 4625 (failed logon from brute force), Event ID 1102 (audit log cleared), Event ID 4688 (process creation) |
 | **Integrity Monitoring** | Changes to `C:\Windows\System32\drivers\etc\hosts`, system file modifications |
 | **Application Control** | Execution of unauthorized binaries dropped by the attacker |
-
-> **Key concept for the session:** V1SWP sees what the OS sees — process executions, file writes, registry changes, logon events. It catches the attacker *after* they land on the machine. DDI catches them *before* or *while* they move laterally across the network. Together they eliminate blind spots.
 
 **How to install (pre-lab):**
 Vision One > Endpoint Security > Agent Installer → download the appropriate installer for Windows or Linux → deploy via SSM Session Manager on each target instance.
@@ -42,24 +40,45 @@ Set IPS to **Prevent** mode — this creates natural teachable moments during th
 
 ---
 
-### 2. DDI + Network Sensor — Network Detection
+### 2. EDR — Endpoint Detection and Response
 
-**Deep Discovery Inspector (DDI)** is a dedicated network appliance deployed in VPC2. It receives a full copy of all VPC2 traffic via **AWS VPC Traffic Mirroring** and inspects it for threats at the packet and protocol level — with no agent required on the endpoints.
+**EDR (Endpoint Detection and Response)** is active on all three VPC2 machines alongside the V1SWP agent. While V1SWP handles prevention (blocking malware, enforcing IPS rules), EDR is the telemetry and investigation layer: it records a continuous stream of process executions, network connections, file operations, and registry changes, and feeds that telemetry into the **Vision One XDR Workbench**.
 
-**Network Sensor** is the Vision One integration that surfaces DDI detections in the XDR workbench and correlates them with endpoint telemetry from V1SWP to build a complete attack timeline.
+EDR is what turns individual host events into a correlated attack story. When V1SWP blocks or flags something, EDR supplies the surrounding context — what process spawned it, what it touched, where it connected — so the Workbench can stitch attacker activity across all three hosts into a single incident timeline.
+
+| Capability | What it contributes in this lab |
+|---|---|
+| **Process telemetry** | Execution chains: wmiexec → cmd.exe → net.exe, PSExec service install → payload |
+| **Network telemetry** | Outbound C2 connections, east-west lateral connections from each endpoint's perspective |
+| **File telemetry** | Payload drops, EICAR writes, mass file rename (ransomware sim) |
+| **Registry telemetry** | Persistence key writes (Run keys, scheduled tasks) |
+| **XDR correlation** | Links endpoint-side evidence to DDI network detections in the Workbench incident graph |
+
+**How to enable (pre-lab):**
+EDR is enabled at the policy level in Vision One > Endpoint Security > Server & Workload Protection > Policies → **Activity Monitoring** → turn on. This is what populates the XDR Workbench with endpoint telemetry.
+
+> **Key concept for the session:** V1SWP blocks and alerts at the host boundary. EDR records everything the OS does so the Workbench can reconstruct the full attack chain. DDI sees the same activity on the wire. All three feed the same Workbench incident — each layer fills gaps the other two cannot cover alone.
 
 ---
 
-### How They Complement Each Other
+### 3. NDR — Network Detection and Response (DDI + Network Sensor)
 
-| | V1SWP (host agent) | DDI + Network Sensor |
-|---|---|---|
-| **Installed on** | Each workload (Windows, Ubuntu-1, Ubuntu-2) | Dedicated network appliance in VPC2 |
-| **Sees** | OS-level events: processes, files, registry, logons | Network traffic: packets, protocols, connections |
-| **Catches** | Attacker actions *on* the machine | Attacker actions *between* machines |
-| **Example** | PowerShell execution, LSASS access, file encryption | Port scan, JNDI injection in HTTP, C2 beacon |
-| **Vision One surface** | Endpoint Security > Endpoints | Network Security > Network Sensor |
-| **XDR correlation** | Yes — contributes endpoint telemetry to workbench | Yes — contributes network detections to workbench |
+**Deep Discovery Inspector (DDI)** is a dedicated network appliance deployed in VPC2. It receives a full copy of all VPC2 traffic via **AWS VPC Traffic Mirroring** and inspects it for threats at the packet and protocol level — with no agent required on the endpoints.
+
+**Network Sensor** is the Vision One integration that surfaces DDI detections in the XDR Workbench and correlates them with endpoint telemetry from V1SWP and EDR to build a complete attack timeline. Together, DDI and Network Sensor form the **NDR** layer.
+
+---
+
+### How the Three Layers Complement Each Other
+
+| | V1ES / V1SWP (host prevention) | EDR (host telemetry) | NDR — DDI + Network Sensor |
+|---|---|---|---|
+| **Installed on** | Each workload (Windows, Ubuntu-1, Ubuntu-2) | Each workload (same agent, separate module) | Dedicated network appliance in VPC2 |
+| **Sees** | OS-level events: processes, files, registry, logons | Continuous process/file/network/registry stream | Network traffic: packets, protocols, connections |
+| **Catches** | Attacker actions *on* the machine — blocks in real time | Full execution context before and after an event | Attacker actions *between* machines |
+| **Example** | PowerShell execution blocked, LSASS access alerted | Process chain: wmiexec → cmd → powershell -enc | Port scan, JNDI injection in HTTP, C2 beacon |
+| **Vision One surface** | Endpoint Security > Endpoints | XDR Workbench (telemetry node graph) | Network Security > Network Sensor |
+| **XDR correlation** | Yes — prevention events feed workbench | Yes — primary telemetry source for workbench | Yes — contributes network detections to workbench |
 
 ---
 
